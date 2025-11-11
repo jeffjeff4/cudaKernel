@@ -237,7 +237,7 @@ extern "C" void solve(const float* input, float* output, int N) {
 //---------------------------------------------------------------------------------------------------
 //method3
 //correct
-///*
+/*
 
 #include <cuda_runtime.h>
 
@@ -254,6 +254,7 @@ extern "C" void solve(const float* input, float* output, int N) {
 // * 1. The INCLUSIVE scan of its local chunk, which it writes to 'output'.
 // * 2. The TOTAL SUM of its local chunk, which it writes to 'block_sums'.
 //
+
 __global__ void scanBlock(const float* input, float* output, int N, float* block_sums) {
     int n = threadIdx.x + blockDim.x * blockIdx.x;
     int t = threadIdx.x;
@@ -588,5 +589,66 @@ extern "C" void solve(const float* input, float* output, int N) {
 //*/
 
 
+//---------------------------------------------------------------------------------------------------
+//method13
+//wrong
+///*
 
+__device__ void warpReduce(volatile float* sdata, int tid) {
+    sdata[tid] += sdata[tid + 32];
+    sdata[tid] += sdata[tid + 16];
+    sdata[tid] += sdata[tid + 8];
+    sdata[tid] += sdata[tid + 4];
+    sdata[tid] += sdata[tid + 2];
+    sdata[tid] += sdata[tid + 1];
+}
+
+__global__ void scanBlock(const float* input, float* output, int N, float* block_sums) {
+    int n = threadIdx.x + blockDim.x * blockIdx.x;
+    int t = threadIdx.x;
+    if (n >= N) return;
+    volatile __shared__ float sh[BLOCK];
+    sh[t] = input[n];
+    __syncthreads();
+
+    for (unsigned int step=blockDim.x/2; step>32; step>>=1) {
+        if (t < step) {
+            sh[t] += sh[t+step];
+        }
+        __syncthreads();
+    }
+
+    if (t < 32) {
+        warpReduce(sh, t);
+    }
+
+    if (t == 0) {
+        output[n] = sh[t];
+        block_sums[blockIdx.x] = sh[t];
+    }
+}
+
+__global__ void mergeWithBlockSums(float* output, int N, float* block_sums) {
+    int b = blockIdx.x;
+    int n = threadIdx.x + blockDim.x * (b+1);
+    if (n >= N) return;
+    output[n] += block_sums[b];
+}
+
+void scan(const float* input, float* output, int N) {
+    float* block_sums;
+    int block_sums_len = cdiv(N, BLOCK);
+
+    cudaMalloc((void**)&block_sums, block_sums_len * sizeof(float));
+    scanBlock<<<cdiv(N, BLOCK), BLOCK>>>(input, output, N, block_sums);
+    if (N <= BLOCK) return;
+    scan(block_sums, block_sums, block_sums_len);
+    mergeWithBlockSums<<<cdiv(N-BLOCK, BLOCK), BLOCK>>>(output, N, block_sums);
+}
+
+// input, output are device pointers
+extern "C" void solve(const float* input, float* output, int N) {
+    scan(input, output, N);
+} 
+//*/
 
