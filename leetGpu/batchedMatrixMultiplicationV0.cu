@@ -178,41 +178,6 @@ __device__ __forceinline__ void store_Reg_To_Global(T* tCgC, const T* tCrC, int 
     }
 }
 
-/*
-template <int BM, int BN, int WM, int WN, int TM, int TN, typename vec_t, typename T>
-__device__ __forceinline__ void store_Reg_To_Global(T* tCgC, const T* tCrC, int ldc, int M, int N, int wm_id, int wn_id, int tm_vec_id, int tn_vec_id) {
-    // tCgC: BM*BN, tCrC: TM*TN
-    constexpr int vec_size = sizeof(vec_t) / sizeof(T);
-    constexpr int TM_vec_num = TM / vec_size;
-    constexpr int TN_vec_num = TN / vec_size;
-    constexpr int WM_per_loop = WM / TM_vec_num;
-    constexpr int WN_per_loop = WN / TN_vec_num;
-
-    auto* tCtCgC = local_tile(tCgC, WM, WN, wm_id, wn_id, ldc);
-
-    int valid_m = M - wm_id * WM_per_loop;
-    int valid_n = N - wn_id * WN_per_loop;
-    //int tid = threadIdx.y * blockDim.x + threadIdx.x;
-
-    #pragma unroll
-    for (int tm_loop=0; tm_loop < TM_vec_num; ++tm_loop) {
-        #pragma unroll
-        for (int vid=0; vid<vec_size; ++vid) {
-            int m = tm_loop * WM_per_loop + tm_vec_id * vec_size + vid;
-            int _m = tm_loop * vec_size + vid;
-
-            #pragma unroll
-            for (int tn_loop=0; tn_loop < TN_vec_num; ++ tn_loop) {
-                int n = tn_loop * WN_per_loop + tn_vec_id * vec_size;
-                int _n = tn_loop * vec_size;
-                if (m < valid_m and n < valid_n) {
-                    get_offset(vec_t, tCtCgC, m, n, ldc) [0] = get_offset(vec_t, tCrC, _m, _n, TN) [0];
-                }
-            }
-        }
-    }
-}
-*/
 
 template<typename T>
 __device__ __forceinline__ void printTensor(const T* tensor, int rows, int cols, int ld) {
