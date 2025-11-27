@@ -12,23 +12,23 @@
             std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ \
                      << " - " << cudaGetErrorString(error) << std::endl; \
             exit(1); \
-         \
-     while(0)
+        } \
+    } while(0)
 
 #define get_offset(T, ptr, row, col, ld) ((T*)((ptr) + (row) * (ld) + (col)))
 #define local_tile(ptr, tileM, tileN, row, col, ld) ((ptr) + (row)*(tileM)*(ld) + (col)*(tileN))
 
 template<int x>
 __host__ __device__ static constexpr int get_log2x() {
-    static_assert(x>0 and (x, (x-1)) == 0);
+    static_assert(x>0 and (x & (x-1)) == 0);
     int v = x;
     int res = 0;
     while (v>1) {
         v>>= 1;
         ++res;
-    
+    }
     return res;
-
+}
 
 __global__ void sgemm_Kernel_Naive(const float* A, const float* B, float* C, int M, int N, int K) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -43,10 +43,10 @@ __global__ void sgemm_Kernel_Naive(const float* A, const float* B, float* C, int
         float rC = 0.0f;
         for (int k=0; k<K; ++k) {
             rC += A[row*K + k] * B[k * N + col];
-        
+        }
         C[row * N + col] = rC;
-    
-
+    }
+}
 
 template <int TileM, int TileN, int cta_size, bool trans, typename vec_t, typename T>
 __device__ __forceinline__ void load_Global_To_Shared(T* dst, const T* src, int ld_dst, int ld_src, int M, int N, int tid) {
@@ -61,23 +61,23 @@ __device__ __forceinline__ void load_Global_To_Shared(T* dst, const T* src, int 
 
     #pragma unroll
     for (int loopid=0, idx=tid; loopid<num_loop; ++loopid, idx+=cta_size) {
-        int n = (idx, (num_threads_per_N-1)) * vec_size;
+        int n = (idx & (num_threads_per_N-1)) * vec_size;
         int m = idx>>get_log2x<num_threads_per_N>();
 
         if (m>=M || n>=N) continue;
 
         if constexpr (!trans) {
             get_offset(vec_t, dst, m, n, ld_dst)[0] = get_offset(vec_t, src, m, n, ld_src)[0];
-         else {
+        } else {
             auto vec_v = get_offset(vec_t, src, m, n, ld_src)[0];
 
             #pragma unroll
             for (int vid=0; vid<vec_size; ++vid) {
                 get_offset(T, dst, n+vid, m, ld_dst)[0] = reinterpret_cast<T*>(&vec_v)[vid];
-            
-        
-    
-
+            }
+        }
+    }
+}
 
 
 
@@ -103,7 +103,7 @@ __device__ __forceinline__ void load_Shared_To_Reg(T* tArA, T* tBrB, const T* sA
             int m = tm_loop * WM_per_loop + tm_vec_id * vec_size;
             int _m = tm_loop * vec_size;
             get_offset(vec_t, tArA, kid, _m, TM) [0] = get_offset(vec_t, tAsA, kid, m, BM) [0];
-        
+        }
 
         //load B
         #pragma unroll
@@ -111,9 +111,9 @@ __device__ __forceinline__ void load_Shared_To_Reg(T* tArA, T* tBrB, const T* sA
             int n = tn_loop * WN_per_loop + tn_vec_id * vec_size;
             int _n = tn_loop * vec_size;
             get_offset(vec_t, tBrB, kid, _n, TN) [0] = get_offset(vec_t, tBsB, kid, n, BN) [0];
-        
-    
-
+        }
+    }
+}
 
 
 template <int WK, int TM, int TN, int TK, typename T>
@@ -130,11 +130,11 @@ __device__ __forceinline__ void mma(T* tCrC, const T* tArA, const T* tBrB)  {
                 #pragma unroll
                 for (int n=0; n<TN; ++n) {
                     tCrC[m * TN + n] += tArA[_k * TM + m] * tBrB[_k * TN + n];
-                
-            
-        
-    
-
+                }
+            }
+        }
+    }
+}
 
 
 template <int BM, int BN, int WM, int WN, int TM, int TN, typename VecT, typename T>
@@ -152,10 +152,10 @@ __device__ __forceinline__ void store_Reg_To_Global(T* tCgC, const T* tCrC, int 
     int validN = N - wn_id * WN_per_loop;
     //int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-    // if (blockIdx.x == 1,& blockIdx.y == 0,& wm_id == 0,& wn_id == 0) {
+    // if (blockIdx.x == 1 && blockIdx.y == 0 && wm_id == 0 && wn_id == 0) {
     //     printf("store_reg_to_global: WM_per_loop=%d, WN_per_loop=%d, TM_vec_num=%d, TN_vec_num=%d\n", WM_per_loop, WN_per_loop, TM_vec_num, TN_vec_num);
     //     printf("wm_id=%d, wn_id=%d, tm_vec_id=%d, tn_vec_id=%d, M=%d, N=%d, validM=%d, validN=%d\n", wm_id, wn_id, tm_vec_id, tn_vec_id, M, N, validM, validN);
-    // 
+    // }
 
     #pragma unroll
     for (int tm_loop = 0; tm_loop < TM_vec_num; ++tm_loop) {
@@ -167,16 +167,16 @@ __device__ __forceinline__ void store_Reg_To_Global(T* tCgC, const T* tCrC, int 
             for (int tn_loop = 0; tn_loop < TN_vec_num; ++tn_loop) {
                 int n = tn_loop * WN_per_loop + tn_vec_id * VecSz;
                 int _n = tn_loop * VecSz;
-                if (m < validM,& n < validN) {
-                    // if (blockIdx.x == 1,& blockIdx.y == 0,& tid == 0) {
+                if (m < validM && n < validN) {
+                    // if (blockIdx.x == 1 && blockIdx.y == 0 && tid == 0) {
                     //     printf("store: tid=%d, validM=%d, validN=%d, wm_id=%d, wn_id=%d, m=%d, n=%d, _m=%d, _n=%d, tm_loop=%d, tn_loop=%d\n", tid, validM, validN, wm_id, wn_id, m, n, _m, _n, tm_loop, tn_loop);
-                    // 
+                    // }
                     get_offset(VecT, tCtCgC, m, n, ldc)[0] = get_offset(VecT, tCrC, _m, _n, TN)[0];
-                
-            
-        
-    
-
+                }
+            }
+        }
+    }
+}
 
 
 template<typename T>
@@ -184,10 +184,10 @@ __device__ __forceinline__ void printTensor(const T* tensor, int rows, int cols,
     for (int i=0; i<rows; ++i) {
         for (int j=0; j<cols; ++j) {
             printf("%.2f ,", tensor[i*ld+j]);        
-        
+        }
         printf("\n");
-    
-
+    }
+}
 
 template <int BM, int BN, int BK, int WM, int WN, int WK, int TM, int TN, int TK, 
             int cta_size, typename vec_t>
@@ -203,8 +203,8 @@ void sgemm_Kernel_Universal_Pipeline_TT(const float* __restrict__ A, const float
     C += batch_id * M * N;
 
     extern __shared__ float smem[];
-    float* sA[2] = {smem, smem+BK*BM;
-    float* sB[2] = {smem+2*BK*BM, smem+2*BK*BM+BK*BN;
+    float* sA[2] = {smem, smem+BK*BM};
+    float* sB[2] = {smem+2*BK*BM, smem+2*BK*BM+BK*BN};
 
     int bmid = blockIdx.y;
     int bnid = blockIdx.x;
@@ -234,13 +234,13 @@ void sgemm_Kernel_Universal_Pipeline_TT(const float* __restrict__ A, const float
     //warp level
     constexpr int NWarps_dim_N = (BN/WN);
     constexpr int NWarps_dim_M = (BM/WM);
-    static_assert((NWarps_dim_N, (NWarps_dim_N-1)) == 0);
-    static_assert((NWarps_dim_M, (NWarps_dim_M-1)) == 0);
+    static_assert((NWarps_dim_N & (NWarps_dim_N-1)) == 0);
+    static_assert((NWarps_dim_M & (NWarps_dim_M-1)) == 0);
     const int warp_id = tid>>5;
-    const int lane_id = tid, 0x1F;
+    const int lane_id = tid & 0x1F;
     static_assert(get_log2x<NWarps_dim_N>() == 2);
     const int wm_id = warp_id >> get_log2x<NWarps_dim_N>();
-    const int wn_id = warp_id, (NWarps_dim_N-1);
+    const int wn_id = warp_id & (NWarps_dim_N-1);
 
     //thread level
     //constexpr int TM_vec_num = TM / vec_size;
@@ -248,12 +248,12 @@ void sgemm_Kernel_Universal_Pipeline_TT(const float* __restrict__ A, const float
     //constexpr int WM_per_loop = WM /TM_vec_num;
     constexpr int WN_per_loop = WN /TN_vec_num;
     const int tm_vec_id = lane_id >> get_log2x<WN_per_loop/vec_size>();
-    const int tn_vec_id = lane_id, (WN_per_loop/vec_size-1);
+    const int tn_vec_id = lane_id & (WN_per_loop/vec_size-1);
 
     //thread register
     float tArA[WK*TM];
     float tBrB[WK*TN];
-    float tCrC[TM*TN] = {0.0f;
+    float tCrC[TM*TN] = {0.0f};
 
     //load
     load_Global_To_Shared<BM, BK, cta_size, true, vec_t>(sA[curr_buffer_id], tAgA, BM, lda, rest_m, (K - bkid*BK), tid);
@@ -275,14 +275,14 @@ void sgemm_Kernel_Universal_Pipeline_TT(const float* __restrict__ A, const float
             load_Shared_To_Reg<BM, BN, BK, WM, WN, WK, TM, TN, vec_t>(tArA, tBrB, sA[curr_buffer_id], sB[curr_buffer_id], wm_id, wn_id, wk_id, tm_vec_id, tn_vec_id);
             //mma
             mma<WK, TM, TN, TK>(tCrC, tArA, tBrB);
-        
+        }
 
         //barrier
         __syncthreads();
 
         //switch buffer
         curr_buffer_id ^= 1;
-    
+    }
 
     #pragma unroll
     for(int wk_id=0; wk_id<BK/WK; ++wk_id) {
@@ -290,11 +290,11 @@ void sgemm_Kernel_Universal_Pipeline_TT(const float* __restrict__ A, const float
         load_Shared_To_Reg<BM, BN, BK, WM, WN, WK, TM, TN, vec_t>(tArA, tBrB, sA[curr_buffer_id], sB[curr_buffer_id], wm_id, wn_id, wk_id, tm_vec_id, tn_vec_id);
         //mma
         mma<WK, TM, TN, TK>(tCrC, tArA, tBrB);
-    
+    }
 
     //store
     store_Reg_To_Global<BM, BN, WM, WN, TM, TN, vec_t>(tCgC, tCrC, ldc, rest_m, rest_n, wm_id, wn_id, tm_vec_id, tn_vec_id);
-
+}
 
 
 template <int BM, int BN, int BK, int WM, int WN, int WK, int TM, int TN, int TK, 
@@ -311,8 +311,8 @@ void sgemm_Kernel_Universal_Pipeline_TT_Specialized(const float* __restrict__ A,
     C += batch_id * M * N;
 
     extern __shared__ float smem[];
-    float* sA[2] = {smem, smem+BK*BM;
-    float* sB[2] = {smem+2*BK*BM, smem+2*BK*BM+BK*BN;
+    float* sA[2] = {smem, smem+BK*BM};
+    float* sB[2] = {smem+2*BK*BM, smem+2*BK*BM+BK*BN};
 
     int bmid = blockIdx.y;
     int bnid = blockIdx.x;
@@ -342,13 +342,13 @@ void sgemm_Kernel_Universal_Pipeline_TT_Specialized(const float* __restrict__ A,
     //warp level
     constexpr int NWarps_dim_N = (BN/WN);
     constexpr int NWarps_dim_M = (BM/WM);
-    static_assert((NWarps_dim_N, (NWarps_dim_N-1)) == 0);
-    static_assert((NWarps_dim_M, (NWarps_dim_M-1)) == 0);
+    static_assert((NWarps_dim_N & (NWarps_dim_N-1)) == 0);
+    static_assert((NWarps_dim_M & (NWarps_dim_M-1)) == 0);
     const int warp_id = tid>>5;
-    const int lane_id = tid, 0x1F;
+    const int lane_id = tid & 0x1F;
     static_assert(get_log2x<NWarps_dim_N>() == 2);
     const int wm_id = warp_id >> get_log2x<NWarps_dim_N>();
-    const int wn_id = warp_id, (NWarps_dim_N-1);
+    const int wn_id = warp_id & (NWarps_dim_N-1);
 
     //thread level
     constexpr int TM_vec_num = TM / vec_size;
@@ -356,12 +356,12 @@ void sgemm_Kernel_Universal_Pipeline_TT_Specialized(const float* __restrict__ A,
     constexpr int WM_per_loop = WM /TM_vec_num;
     constexpr int WN_per_loop = WN /TN_vec_num;
     const int tm_vec_id = lane_id >> get_log2x<WM_per_loop/vec_size>();
-    const int tn_vec_id = lane_id, (WN_per_loop/vec_size-1);
+    const int tn_vec_id = lane_id & (WN_per_loop/vec_size-1);
 
     //thread register
     float tArA[WK*TM];
     float tBrB[WK*TN];
-    float tCrC[TM*TN] = {0.0f;
+    float tCrC[TM*TN] = {0.0f};
 
     //load
     load_Global_To_Shared<BM, BK, cta_size, true, vec_t>(sA[curr_buffer_id], tAgA, BM, lda, rest_m, (K - bkid*BK), tid);
@@ -383,14 +383,14 @@ void sgemm_Kernel_Universal_Pipeline_TT_Specialized(const float* __restrict__ A,
             load_Shared_To_Reg<BM, BN, BK, WM, WN, WK, TM, TN, vec_t>(tArA, tBrB, sA[curr_buffer_id], sB[curr_buffer_id], wm_id, wn_id, wk_id, tm_vec_id, tn_vec_id);
             //mma
             mma<WK, TM, TN, TK>(tCrC, tArA, tBrB);
-        
+        }
 
         //barrier
         __syncthreads();
 
         //switch buffer
         curr_buffer_id ^= 1;
-    
+    }
 
     #pragma unroll
     for(int wk_id=0; wk_id<BK/WK; ++wk_id) {
@@ -398,11 +398,11 @@ void sgemm_Kernel_Universal_Pipeline_TT_Specialized(const float* __restrict__ A,
         load_Shared_To_Reg<BM, BN, BK, WM, WN, WK, TM, TN, vec_t>(tArA, tBrB, sA[curr_buffer_id], sB[curr_buffer_id], wm_id, wn_id, wk_id, tm_vec_id, tn_vec_id);
         //mma
         mma<WK, TM, TN, TK>(tCrC, tArA, tBrB);
-    
+    }
 
     //store
     store_Reg_To_Global<BM, BN, WM, WN, TM, TN, vec_t>(tCgC, tCrC, ldc, rest_m, rest_n, wm_id, wn_id, tm_vec_id, tn_vec_id);
-
+}
 
 
 // A, B, C are device pointers
@@ -414,7 +414,7 @@ extern "C" void solve(const float* A, const float* B, float* C, int BATCH, int M
                            BATCH);
 
         sgemm_Kernel_Naive<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K); 
-    ;
+    };
     constexpr int BM = 256;
     constexpr int BN = 128;
     constexpr int BK = 16;
@@ -445,7 +445,7 @@ extern "C" void solve(const float* A, const float* B, float* C, int BATCH, int M
         //CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaGetLastError());
         printf("end sgemm_Kernel_Universal_Pipeline_TT_Specialized\n");
-    ;
+    };
 
     auto launch_Pipeline_Specialized = [&] () {
         using vec_t = uint4;
@@ -465,25 +465,27 @@ extern "C" void solve(const float* A, const float* B, float* C, int BATCH, int M
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaGetLastError());
         printf("end sgemm_Kernel_Universal_Pipeline_TT_Specialized\n");
-    ;
+    };
 
     auto is_aligned = [] (const float* ptr, int size) {
         return (uintptr_t(ptr) % size) == 0;
-    ;
+    };
     if (M==8192 and N==6144 and K==4096) {
         // use the specialized kernel for perf test
         launch_Pipeline_Specialized();
-     else if (is_aligned(A, 16) and is_aligned(B, 16) and is_aligned(C, 16) and 
+    } else if (is_aligned(A, 16) and is_aligned(B, 16) and is_aligned(C, 16) and 
                 M%8==0 and N%8==0 and K%8==0 and 
                 M>=BM and N>=BN and K%BK==0) {
         // use the optimized kernel
         //printf()"using the optimized kernel with M=%d, N=%d, K=%d\n", M, N, K);
         launch_Pipeline();
-     else {
+    } else {
         // if M, N, K % 8 !=0, can not use the optimized kernel
         //printf("using naive kernel due to M=%d, N=%d, K=%d not being nultiple of 8 or too small.\n", M, N, K);
         launch_Naive();
-    
+    }
+
+}     
 
  
 
@@ -6460,6 +6462,218 @@ global_col_base = (tn_vec_id * 32)
 
 /*
 question40:
+
+画出最终的 memory coalescing 写回路径（按 128B warp store）
+
+好 —— 我把**register layout → global layout 的“写回（store）”路径**，按 **128-byte warp store**（常见的全局内存传输粒度）完整画出来并解释清楚。目标是让你能看到：
+
+* 每个 128B 内存事务包含哪些元素（以 float 为单位）；
+* 哪些线程写哪些 16B/32B/128B 子段（vec4 与 vec blocks）；
+* 当线程以当前 kernel 的映射写回数据时，硬件如何把多个小写合并为尽可能少的 128B 传输（即 coalescing）；
+* 并用 ASCII 图把具体的地址槽（slot）与 thread 映射画出来，带示例坐标。
+
+我会先把前提（参数与公式）再写一遍，然后直接给出 ASCII 图与逐项解释。
+
+---
+
+## 前提（与你的配置 — 必须记住）
+
+```
+元素大小 float = 4 bytes
+vec_size = 4  => 每次 vec store 写 4 floats = 16 bytes (float4)
+TM = 8        => 每个 thread 有 8 行（_reg rows）
+TN = 32       => 每个 thread 每行写 32 列 = 8 vec4（8 * 4 = 32）
+WM = 64, WN = 64  => warp 负责 C tile = 64×64
+TM_vec_num = 2, TN_vec_num = 8
+WM_per_loop = 32, WN_per_loop = 8
+```
+
+**重要的内存事务尺寸**：
+
+* 1 float  = 4 B
+* 1 vec4   = 4 floats = 16 B
+* 128 B = 128 / 4 = 32 floats = 一行中连续的 32 列（float 元素）构成 1 个 128B segment
+
+所以：在每一行（固定 m），**columns 0..31** 是第 128B 区间，**columns 32..63** 是第二个 128B 区间。
+
+---
+
+## 高级结论（先读这部分）
+
+* 对任何固定的行 `m`，Global 内存按 128B segments 划分：`[0..31]` (128B)，`[32..63]` (128B)。
+* 每个 128B segment 包含 **8 个 vec4 槽**（每槽 16B），槽号按列顺序是：slot0=(0..3), slot1=(4..7), … slot7=(28..31)。
+* 在你的映射里（vec4 granularity），这些 **8 个 vec4 槽**通常会被 **8 个不同的 thread（来自不同 lane）分别写入**。当这些写请求同时发生并且地址对齐时，硬件能把这些写合并为 **一个 128B 全体写事务**（单次 global store）。
+* 因此要实现良好 coalescing：确保每个 128B segment 的槽被线程以对齐的 16B (vec4) 写出，并且起始地址对齐到 128B 边界（通常由 tile 与 lda 保证）。
+
+下面通过 ASCII 图把这个过程“拆开来看”。
+
+---
+
+## 1) 单行（fixed m）内 128B segment 的槽分配示意（ASCII）
+
+我们看 `row m = r`（假定 r 在 0..63 的某个值），关注该行的前 128B（columns 0..31）。该 128B 被 8 个 vec4 槽划分：
+
+```
+Row r, columns  0 .. 31  (128 bytes total)
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| slot 0    | slot 1    | slot 2    | slot 3    | slot 4    | slot 5    | slot 6    | slot 7    |
+| cols 0..3 | cols 4..7 | cols 8..11| cols12..15| cols16..19| cols20..23| cols24..27| cols28..31|
+| each 16B  | each 16B  |    ...    |   ...     |    ...    |    ...    |    ...    |   ...     |
++-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+ total = 8 * 16B = 128B
+```
+
+**硬件合并条件（简述）**：
+
+* 如果在同一个 128B segment 内的多个 16B 子槽都被 warp 上的不同 lanes 写入，硬件会把这些子槽合并为最多 **1 个 128B write**（如果所有要写的槽都在该 128B 内并且地址对齐）。
+* 如果只有部分槽被写，硬件可能需要写回整个 128B（写回掩码由设备决定），但仍然是单个 128B 事务（写掩码降低带宽效率但不增加事务数）。
+
+---
+
+## 2) 在你的 mapping 中，哪些 thread 写这些 slot？（示例）
+
+在你 kernel 的映射逻辑里（tn_vec_id, tn_loop 的组合），**通常**形成的分配模式是：
+
+> 对于行 r 属于某个 tm_vec_id 区间，**来自同一 tm_vec_id 的不同 lanes** 会负责同一行的不同列 vec4 槽；而不同 tm_vec_id 的 lanes 写其它行（m 不同）。
+
+为了让概念更具体，我用一个**可复现的示例映射**（与你先前的规则一致的常见安排）给出实际的 lane↔slot 对应（注意：这里的示例映射反映“最常见、也合理的” lane 分配 — 旨在说明 coalescing）：
+
+* 假设处理 `rows 0..7` 的 8 个 threads 为 `lane 0..7`（tm_vec_id=0 的那一组）。对于这些行中的任一行（0..7），它们会 **联合写入 columns 0..31 的 8 个 slot**。一个常见且直观的分派是：
+
+```
+slot0 (cols 0..3)   <- lane 0
+slot1 (cols 4..7)   <- lane 1
+slot2 (cols 8..11)  <- lane 2
+slot3 (cols12..15)  <- lane 3
+slot4 (cols16..19)  <- lane 4
+slot5 (cols20..23)  <- lane 5
+slot6 (cols24..27)  <- lane 6
+slot7 (cols28..31)  <- lane 7
+```
+
+（注意：实际代码中 lane->slot 的 exact mapping 可能是按不同 bit 操作 interleave，但结果仍是“一个 128B 的 8 个 vec4 槽被 warp 中的不同 lanes 覆盖”。）
+
+**结论（对这个行 r）**： lanes 0..7 在同一时间点分别写入该 128B 内的 8 个 16B 子槽 → 硬件能把它们合并成一个 128B write（完全 coalesced）。
+
+---
+
+## 3) ASCII：把上面放入 64×64 tile（展示每个 128B segment 被哪些 lanes 覆盖）
+
+我把整个 64×64 抽成 8×8 个 8×8 子格（每个子格代表 8 rows × 8 cols）；但我们重点标出 128B segment（32 cols）边界。为可读性，用 `[]` 表示 128B segment（32 列宽），在每个 segment 内按 16B vec slots 给出负责的 lane id（示例分配，按上面规则）。
+
+```
+Global C 64×64 (rows 0..63, cols 0..63)
+Each row has two 128B segments: [ cols 0..31 ]  and  [ cols 32..63 ]
+
+I'll show rows grouped by 8 (since each Reg tile is 8 rows).
+
+Rows 0..7  (tm_vec_id = group 0)
+Segment A: cols 0..31  (128B)
+  slots: [ s0 s1 s2 s3 s4 s5 s6 s7 ]
+  lanes:  [  0  1  2  3  4  5  6  7 ]   <-- each lane writes one vec4 (16B)
+Segment B: cols 32..63 (128B)
+  slots: [ s0 s1 s2 s3 s4 s5 s6 s7 ]
+  lanes:  [  8  9 10 11 12 13 14 15 ]   <-- lanes 8..15 write these vec4s for rows 0..7
+
+Rows 8..15 (tm_vec_id = group 1)
+Segment A (cols0..31): lanes [16 17 18 19 20 21 22 23]
+Segment B (cols32..63): lanes [24 25 26 27 28 29 30 31]
+
+Rows 16..23
+Segment A: lanes [ 0 1 2 3 4 5 6 7 ]   (pattern repeats across blocks)
+Segment B: lanes [ 8..15 ]
+
+Rows 24..31
+Segment A: lanes [16..23]
+Segment B: lanes [24..31]
+
+Rows 32..39  (the second half rows)
+... same pattern repeating, but mapped to row indices +32
+```
+
+（上面 lane→segment 的具体编号是示例性排列，目的是展示：**每个 128B segment 的 8 个 vec4 槽由 8 个不同 lanes 写入，因而能被合并为 1 个 128B store**。）
+
+---
+
+## 4) 更“内存地址”的视角（偏移与对齐）
+
+设 `C` 的基地址 `C_base` 对齐到 128B（重要！若对齐，合并最容易）且行主序为 `ldc = N`（N=64）。
+则行 `r` 中第一段的字节地址范围为：
+
+```
+addr_of(C[r][0]) ... addr_of(C[r][31])
+= C_base + r*ldc*4 + 0*4  ... + r*ldc*4 + 31*4
+= C_base + r*256  ... + r*256 + 124
+```
+
+（因为每行 64 floats = 256 bytes；r*256 跳到行起点；0..31 floats 占 128 bytes）
+
+**如果** 8 个 lanes 各写入上述 8 个 vec4 的 offset（16B each）并且这些 writes 同步发生（warp 的 store stage），则 GPU 将把它们合并为 **1 个 128B write** 到 `C_base + r*256 + 0`。
+
+同理第二段（cols32..63）对应地址 `C_base + r*256 + 128`。
+
+---
+
+## 5) 写回顺序（store ordering / store coalescing 的实际行为简述）
+
+* 在 CUDA 中，一个 warp 的多条线程对同一 128B segment 的不同 16B 子槽同时写入时，设备会尽可能把这些子写合并为很少的内存事务（通常 1 个 128B）。
+* 若某些 vec4 没有被写（比如边界或 predicates），设备可能仍然发出 128B transaction，但写掩码只写实际有数据的位置（仍然是 1 个事务）。这会浪费带宽但不增加事务数量。
+* 若线程写入不对齐（例如某个 vec4 跨越 128B 边界），那么可能会需要 2 个 128B transactions 来完成那次写（性能会下降）。因此**保证每个 vec4 在 16B 对齐，且 tile 起始对齐到 128B**非常重要。
+
+---
+
+## 6) ASCII：把具体地址、slot、lane 在一个行上拼起来（单行详细示例）
+
+取 `row r = 10` 为例（任取），我们画出该行两个 128B segments，并列出每个 16B slot 的字节地址偏移（相对于 `C_base + r*256`)  和 写入线程（示例 lane 配置）：
+
+```
+Row r: base_addr = C_base + r*256
+
+Segment A (addr offset 0..127):
+ slot0: bytes [  0 ..  15]  cols  0..3    <- lane 0  (vec4)
+ slot1: bytes [ 16 ..  31]  cols  4..7    <- lane 1
+ slot2: bytes [ 32 ..  47]  cols  8..11   <- lane 2
+ slot3: bytes [ 48 ..  63]  cols 12..15   <- lane 3
+ slot4: bytes [ 64 ..  79]  cols 16..19   <- lane 4
+ slot5: bytes [ 80 ..  95]  cols 20..23   <- lane 5
+ slot6: bytes [ 96 .. 111]  cols 24..27   <- lane 6
+ slot7: bytes [112 .. 127]  cols 28..31   <- lane 7
+
+=> If lanes 0..7 write these slots concurrently (and base_addr aligned to 128B),
+   the device issues a single 128B write to [base_addr .. base_addr+127].
+
+Segment B (addr offset 128..255):
+ slot0: bytes [128 .. 143]  cols 32..35   <- lane 8
+ slot1: bytes [144 .. 159]  cols 36..39   <- lane 9
+ ...
+ slot7: bytes [240 .. 255]  cols 60..63   <- lane 15
+
+=> lanes 8..15 writing concurrently -> single 128B write to [base_addr+128 .. base_addr+255].
+```
+
+---
+
+## 7) 最后给你一些实战建议（以便优化与验证）
+
+1. **对齐**：确保 `C` 的行首（`C + row*ldc`) 对齐到 128B （通常 ldc * sizeof(float) * something），或至少 `C` 起始地址对 128B 对齐，能最大化合并效率。
+2. **vec4 写**：使用 `float4`/`uint4` 类型的写（如你的 `VecT = uint4`），每次写 16B，容易对齐到 128B 的子槽。
+3. **避免跨 128B 边界**：保证每个 vec store 不跨越 128B 边界（比如起始列 % 8 != something），否则会拆成两个事务。
+4. **验证**：在调试内核里加入 `printf` 输出每个 thread 写入的 byte address（`(uintptr_t)(&C[m][n])`），把输出导到文件并检查同一行同一 128B 区间是否被多条 lane 同步写入；或者用 Nsight Compute 的 "Memory Workload Analysis" 来看真实的事务数。
+5. **边界 case**：如果矩阵宽度不是 64 而是其他，重新计算 `WN_per_loop` 等，保证每 128B 段都被完整或按预期填满。
+
+---
+
+## 总结（一句话）
+
+在你当前的 tile/vec 布局下，每行被分为两个 128B segment（cols 0..31 和 32..63），每个 segment 包含 8 个 vec4（16B）槽；warp 内的不同 lanes 各自写这些槽时，硬件会把它们**合并为一个 128B 写事务**，从而实现高效的 coalesced store —— 条件是地址对齐且 vec4 不跨 128B 边界。上面我给了按槽分配的 ASCII 映射与具体字节偏移示意，方便你根据自己内核验证与调优。
+
+---
+
+如果你需要，我可以立刻（在本回复内）：
+
+* 给出一个**小的 CUDA debug kernel**（带 `printf`）打印每个 thread 在运行时写的字节地址偏移，方便你在本地直接运行验证；
+* 或把上面的示例映射替换成**按你实际 lane->slot 的确切算式**（如果你把那段 lane→tn_vec_id / tm_vec_id 的位运算确认给我），我会把每个 slot 精确对应到 lane ID 并画出完全精确的 ASCII 表。哪一个你想要？
+
 
 
 */
