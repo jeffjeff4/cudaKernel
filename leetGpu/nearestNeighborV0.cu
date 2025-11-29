@@ -1,3 +1,67 @@
+#include <cuda_runtime.h>
+
+#define TILE 256
+
+static __device__ __forceinline__ void load_pts(const float* pts, float* cached_pts, int n){
+    int size = n * 3;
+    size = ((size + 3) >> 2) << 2;
+    for(int i = threadIdx.x * 4; i < size; i += blockDim.x * 4){
+        const float4* bp = (const float4*)(&pts[i]);
+        float4* bc = (float4*)(&cached_pts[i]);
+        bc[0] = bp[0];
+    }
+}
+
+__global__ void nearne(const float* points, int* indices, int N){
+    __shared__ float cached_pts[TILE * 3];
+    __shared__ float cached_other_pts[TILE * 3];
+    __shared__ float min_dist[TILE];
+    __shared__ int min_dist_index[TILE];
+    const int start = blockIdx.x * TILE;
+    const int size = min(TILE, N - start);
+
+    load_pts(points + start * 3, cached_pts, size);
+    for(int i = threadIdx.x; i < size; i += blockDim.x){
+        min_dist[i] = 1e18;
+    }
+
+    for(int bid = 0; bid < gridDim.x; bid++){
+        const int b_start = bid * TILE;
+        const int b_size = min(TILE, N - b_start);
+        load_pts(points + b_start * 3, cached_other_pts, b_size);
+        __syncthreads();
+        for(int i = threadIdx.x; i < size; i += blockDim.x){
+            float x = cached_pts[i * 3], y = cached_pts[i * 3 + 1], z = cached_pts[i * 3 + 2];
+            float mind = min_dist[i];
+            int mini = min_dist_index[i];
+            for(int j = 0; j < b_size; j++){
+                float xj = cached_other_pts[j * 3];
+                float yj = cached_other_pts[j * 3 + 1];
+                float zj = cached_other_pts[j * 3 + 2];
+                float dist = (x - xj) * (x - xj) + (y - yj) * (y - yj) + (z - zj) * (z - zj);
+                dist = (b_start + j == start + i) ? 1e18 : dist;
+                mini = (dist < mind) ? (b_start + j) : mini;
+                mind = min(mind, dist);
+            }
+            min_dist[i] = mind;
+            min_dist_index[i] = mini;
+        }
+
+        __syncthreads();
+    }
+
+    __syncthreads();
+    for(int i = threadIdx.x; i < size; i += blockDim.x)
+        indices[start + i] = min_dist_index[i];
+}
+
+// points and indices are device pointers
+extern "C" void solve(const float* points, int* indices, int N) {
+    int threads = 256;
+    int blocks = (N + TILE - 1) / TILE;
+    nearne<<<blocks, threads>>>(points, indices, N);
+    cudaDeviceSynchronize();
+}
 
 
 
@@ -8,7 +72,7 @@
 question0:
 不理解，请解释，用例子
 
-这段代码实现了一个基于 **CUDA** 的 **最近邻搜索 (Nearest Neighbor Search)** 算法，用于在一个大型三维点云数据集 ($\mathbf{points}$) 中，为每个点找到它的最近邻点的索引。
+这段代码实现了一个基于 **CUDA** 的 **最近邻搜索 (Nearest Neighbor Search)** 算法，用于在一个大型三维点云数据集 (points) 中，为每个点找到它的最近邻点的索引。
 
 该算法使用了 **分块迭代 (Tiled Iteration)** 策略来管理数据，并在共享内存中缓存数据以提高计算效率。
 
@@ -18,15 +82,15 @@ question0:
 
 ### 1\. 算法目标
 
-对于数据集中的每个点 $P_i$，找到另一个点 $P_j$ ($j \ne i$)，使得它们之间的欧几里得距离最短。
+对于数据集中的每个点 P_i，找到另一个点 P_j (j != i)，使得它们之间的欧几里得距离最短。
 
 ### 2\. 内存和参数
 
-  * **$\mathbf{TILE} = 256$:** 每个线程块处理的点的数量。
-  * **$\mathbf{points}$:** 包含 $N$ 个点的三维点云数据 (存储为一维数组，结构为 $[x_0, y_0, z_0, x_1, y_1, z_1, \dots]$)。
-  * **$\mathbf{cached\_pts}$:** 共享内存，存储**被查询点** (Query Points) 的当前 Tile。
-  * **$\mathbf{cached\_other\_pts}$:** 共享内存，存储**搜索点** (Candidate Points) 的当前 Tile。
-  * **$\mathbf{min\_dist}$ / $\mathbf{min\_dist\_index}$:** 共享内存，存储每个被查询点的当前最小距离和对应的索引。
+  * **TILE = 256:** 每个线程块处理的点的数量。
+  * **points:** 包含 N 个点的三维点云数据 (存储为一维数组，结构为 [x_0, y_0, z_0, x_1, y_1, z_1, ...])。
+  * **cached_pts:** 共享内存，存储**被查询点** (Query Points) 的当前 Tile。
+  * **cached_other_pts:** 共享内存，存储**搜索点** (Candidate Points) 的当前 Tile。
+  * **min_dist / min_dist_index:** 共享内存，存储每个被查询点的当前最小距离和对应的索引。
 
 -----
 
@@ -42,12 +106,12 @@ static __device__ __forceinline__ void load_pts(const float* pts, float* cached_
         const float4* bp = (const float4*)(&pts[i]);
         float4* bc = (float4*)(&cached_pts[i]);
         bc[0] = bp[0]; // 向量化加载 4 个 float
-    }
-}
+    
+
 ```
 
-  * **对齐:** `size = ((size + 3) >> 2) << 2` 确保加载的总元素数是对齐到 $\mathbf{4}$ 的倍数（因为使用了 $\mathbf{float4}$ 向量化）。
-  * **协作加载:** 循环步长是 $\mathbf{blockDim.x} \times 4$。所有线程 $\mathbf{threadIdx.x}$ 协作，以 $4$ 个 `float` 为单位，分摊整个 Tile 的加载任务。
+  * **对齐:** `size = ((size + 3) >> 2) << 2` 确保加载的总元素数是对齐到 4 的倍数（因为使用了 float4 向量化）。
+  * **协作加载:** 循环步长是 blockDim.x  *  4。所有线程 threadIdx.x 协作，以 4 个 `float` 为单位，分摊整个 Tile 的加载任务。
 
 -----
 
@@ -64,11 +128,11 @@ const int size = min(TILE, N - start); // 当前 Block 的有效点数
 load_pts(points + start * 3, cached_pts, size); // 加载被查询点 (Query Tile)
 for(int i = threadIdx.x; i < size; i += blockDim.x){
     min_dist[i] = 1e18; // 初始化最小距离为极大值
-}
+
 ```
 
-  * **加载 Query Tile:** 每个线程块启动后，首先加载它需要处理的 $size$ 个点到 $\mathbf{cached\_pts}$。
-  * **初始化:** $\mathbf{min\_dist}$ 和 $\mathbf{min\_dist\_index}$ 被初始化，用于存储这些点的最近邻结果。
+  * **加载 Query Tile:** 每个线程块启动后，首先加载它需要处理的 size 个点到 cached_pts。
+  * **初始化:** min_dist 和 min_dist_index 被初始化，用于存储这些点的最近邻结果。
 
 ### 2\. Grid 迭代循环 (Block 遍历所有候选点)
 
@@ -80,11 +144,11 @@ for(int bid = 0; bid < gridDim.x; bid++){
     __syncthreads();
     // ... 距离计算循环 ...
     __syncthreads();
-}
+
 ```
 
   * **目的:** 每个线程块必须与**所有其他 Block 对应的数据**进行比较。因此，外层循环遍历整个 Grid（所有 Block）。
-  * **加载 Candidate Tile:** 每次循环，线程块将一个新的 $b\_size$ 点的集合加载到 $\mathbf{cached\_other\_pts}$ 中。
+  * **加载 Candidate Tile:** 每次循环，线程块将一个新的 b_size 点的集合加载到 cached_other_pts 中。
 
 ### 3\. 核心计算：距离计算与更新
 
@@ -104,17 +168,17 @@ for(int i = threadIdx.x; i < size; i += blockDim.x){ // 遍历 Query Tile (被�
         // 更新最小距离和索引
         mini = (dist < mind) ? (b_start + j) : mini;
         mind = min(mind, dist);
-    }
+    
     min_dist[i] = mind;
     min_dist_index[i] = mini;
-}
+
 ```
 
-  * **分工:** 每个线程 $t$ 负责处理 Query Tile 中的多个点 ($\mathbf{i}$ 循环)。
-  * **内层 $j$ 循环:** 每个线程将其负责的 Query Point ($\mathbf{i}$) 与当前加载的 Candidate Tile 中的**所有点** ($\mathbf{j}$) 进行比较。
+  * **分工:** 每个线程 t 负责处理 Query Tile 中的多个点 (i 循环)。
+  * **内层 j 循环:** 每个线程将其负责的 Query Point (i) 与当前加载的 Candidate Tile 中的**所有点** (j) 进行比较。
   * **欧氏距离平方:** 避免了昂贵的平方根运算。
   * **排除自身:** `dist = (b_start + j == start + i) ? 1e18 : dist;`
-      * **作用:** 如果候选点 ($b\_start + j$) 恰好就是被查询点 ($start + i$)，则将距离设置为一个极大值，确保它不会被选为最近邻。
+      * **作用:** 如果候选点 (b_start + j) 恰好就是被查询点 (start + i)，则将距离设置为一个极大值，确保它不会被选为最近邻。
 
 ### 4\. 结果写回
 
@@ -125,13 +189,13 @@ for(int i = threadIdx.x; i < size; i += blockDim.x)
 ```
 
   * **同步:** 确保所有 Block 迭代完成后，才将最终结果写入。
-  * **写回:** 将 $\mathbf{min\_dist\_index}$ 中的最终最近邻索引写入全局 $\mathbf{indices}$ 数组。
+  * **写回:** 将 min_dist_index 中的最终最近邻索引写入全局 indices 数组。
 
 -----
 
 ## 🎯 总结
 
-这段代码通过 **双 Tile 缓存** (Query Tile 保持不变，Candidate Tile 循环加载) 和 **Block 迭代**，有效地解决了 $O(N^2)$ 的最近邻搜索问题。
+这段代码通过 **双 Tile 缓存** (Query Tile 保持不变，Candidate Tile 循环加载) 和 **Block 迭代**，有效地解决了 O(N^2) 的最近邻搜索问题。
 
 //--------------------------------------------------------------------------------------------------
 
@@ -168,13 +232,13 @@ question3:
 
     for(int bid = 0; bid < gridDim.x; bid++){
         for(int i = threadIdx.x; i < size; i += blockDim.x){
-        }
+        
 
         __syncthreads();
-    }
+    
 
 
-这是一个关于 CUDA Kernel 中 **线程块内部的协作和负载均衡** 的关键问题。在 `nearne` 这个最近邻搜索 Kernel 中，`i` 的步长被设置为 $\mathbf{blockDim.x}$ 是为了确保 **整个线程块（Block）** 都能参与到 **Query Tile 的处理** 中，实现完全的负载均衡。
+这是一个关于 CUDA Kernel 中 **线程块内部的协作和负载均衡** 的关键问题。在 `nearne` 这个最近邻搜索 Kernel 中，`i` 的步长被设置为 blockDim.x 是为了确保 **整个线程块（Block）** 都能参与到 **Query Tile 的处理** 中，实现完全的负载均衡。
 
 ---
 
@@ -182,63 +246,63 @@ question3:
 
 ### 1. 循环目标
 
-* **外层循环 ($\mathbf{bid}$):** 遍历所有 Candidate Tiles（候选点 Block）。
-* **内层循环 ($\mathbf{i}$):** 遍历当前 Block 已经加载好的 **Query Tile** ($\mathbf{cached\_pts}$) 中的所有点。
+* **外层循环 (bid):** 遍历所有 Candidate Tiles（候选点 Block）。
+* **内层循环 (i):** 遍历当前 Block 已经加载好的 **Query Tile** (cached_pts) 中的所有点。
 
 ### 2. 线程的责任
 
-* 每个线程 $t$ 负责处理 Query Tile 中的 **多于一个** 的点。
-* **$\mathbf{size}$** 是 Query Tile 中点的总数，通常等于 $\mathbf{TILE} = 256$。
-* $\mathbf{blockDim.x}$ 是线程块内的线程总数，假设为 $\mathbf{256}$。
+* 每个线程 t 负责处理 Query Tile 中的 **多于一个** 的点。
+* **size** 是 Query Tile 中点的总数，通常等于 TILE = 256。
+* blockDim.x 是线程块内的线程总数，假设为 256。
 
-## 🚀 II. 为什么步长是 $\mathbf{blockDim.x}$ (256)？
+## 🚀 II. 为什么步长是 blockDim.x (256)？
 
-步长设置为 $\mathbf{blockDim.x}$（256）是为了执行一个经典的 **Block-Stride Loop（线程块步长循环）**。
+步长设置为 blockDim.x（256）是为了执行一个经典的 **Block-Stride Loop（线程块步长循环）**。
 
 ### 1. 保证完全覆盖 Query Tile
 
-如果 $\mathbf{blockDim.x} = \mathbf{size} = 256$（即 Query Tile 有 256 个点，线程块也有 256 个线程）：
+如果 blockDim.x = size = 256（即 Query Tile 有 256 个点，线程块也有 256 个线程）：
 
-* 线程 $tx=0$ 访问 $i=0$。
-* 线程 $tx=1$ 访问 $i=1$。
+* 线程 tx=0 访问 i=0。
+* 线程 tx=1 访问 i=1。
 * ...
-* 线程 $tx=255$ 访问 $i=255$。
-* 循环只执行 $\mathbf{1}$ 次，因为 $256 + 256 \not< 256$。
+* 线程 tx=255 访问 i=255。
+* 循环只执行 1 次，因为 256 + 256 \not< 256。
 
 在这种理想情况下，每个线程只处理一个点。
 
 ### 2. 保证负载均衡 (当 Block > Tile 或 Tile > Block 时)
 
-但通常 $\mathbf{blockDim.x}$ 和 $\mathbf{size}$ 不完全相等，或者线程总数较大（例如 $\mathbf{blockDim.x}=512$）。
+但通常 blockDim.x 和 size 不完全相等，或者线程总数较大（例如 blockDim.x=512）。
 
-* **目的:** 如果 $size$ 远大于 $\mathbf{blockDim.x}$，这个循环模式确保了每个线程都能以 $\mathbf{blockDim.x}$ 为步长，交错地处理 Query Tile 中的所有剩余点。
+* **目的:** 如果 size 远大于 blockDim.x，这个循环模式确保了每个线程都能以 blockDim.x 为步长，交错地处理 Query Tile 中的所有剩余点。
 
 ### 3. 避免 Warp-Level 划分的复杂性
 
-如果使用 $\mathbf{Warp Size (32)}$ 作为步长：
+如果使用 Warp Size (32) 作为步长：
 
-* **问题:** 只有 32 个线程会参与到 $\mathbf{i}$ 循环的第一次迭代中。其余的 224 个线程会处于闲置状态，直到步长达到它们的位置。
+* **问题:** 只有 32 个线程会参与到 i 循环的第一次迭代中。其余的 224 个线程会处于闲置状态，直到步长达到它们的位置。
 * **效率低下:** 这会导致线程块内部出现大量的线程闲置。
 
-**使用 $\mathbf{blockDim.x}$ 作为步长** 是最直接、最简洁的方式，它确保了**线程块内的每一个线程**都能立即从它独有的起始点 ($\mathbf{threadIdx.x}$) 开始工作，并以整个线程块的尺寸 ($\mathbf{blockDim.x}$) 为步长前进，从而均匀地分摊 Query Tile 的所有工作量。
+**使用 blockDim.x 作为步长** 是最直接、最简洁的方式，它确保了**线程块内的每一个线程**都能立即从它独有的起始点 (threadIdx.x) 开始工作，并以整个线程块的尺寸 (blockDim.x) 为步长前进，从而均匀地分摊 Query Tile 的所有工作量。
 
 ---
 
 ## 🔢 III. 示例：负载分摊
 
-假设 $\mathbf{size} = 256$，$\mathbf{blockDim.x} = 100$。
+假设 size = 256，blockDim.x = 100。
 
-| 线程 ID ($\mathbf{tx}$) | 第一次迭代 ($\mathbf{i}$) | 第二次迭代 ($\mathbf{i} + 100$) | 第三次迭代 ($\mathbf{i} + 200$) |
+| 线程 ID (tx) | 第一次迭代 (i) | 第二次迭代 (i + 100) | 第三次迭代 (i + 200) |
 | :--- | :--- | :--- | :--- |
-| **0** | $\mathbf{0}$ | $\mathbf{100}$ | $\mathbf{200}$ |
-| **1** | $\mathbf{1}$ | $\mathbf{101}$ | $\mathbf{201}$ |
-| **99** | $\mathbf{99}$ | $\mathbf{199}$ | $\mathbf{299}$ (超出 $\mathbf{size}$，停止) |
+| **0** | 0 | 100 | 200 |
+| **1** | 1 | 101 | 201 |
+| **99** | 99 | 199 | 299 (超出 size，停止) |
 
 * **结果:** Query Tile 的 256 个点被 100 个线程均匀分摊。每个线程处理 2 或 3 个点。
 
 ## 结论
 
-步长设置为 $\mathbf{blockDim.x}$ 是为了执行 **协作式 Block-Stride Loop**，保证线程块内的 **每一个线程** 都能立即获得并均匀分摊 Query Tile 的所有计算任务。
+步长设置为 blockDim.x 是为了执行 **协作式 Block-Stride Loop**，保证线程块内的 **每一个线程** 都能立即获得并均匀分摊 Query Tile 的所有计算任务。
 
 
 //--------------------------------------------------------------------------------------------------
@@ -257,53 +321,53 @@ question4:
 
     这是 CUDA 编程中一个非常常见的位操作技巧，用于将变量 `size` 的值 **向上对齐（Align Up）** 到最接近的 **4 的倍数**。
 
-在您的代码中，由于点云数据是三维的 ($x, y, z$)，并且使用了 `float4`（或 `int4` 等）进行向量化加载，数据量必须是 4 的倍数才能进行高效的向量化读写。
+在您的代码中，由于点云数据是三维的 (x, y, z)，并且使用了 `float4`（或 `int4` 等）进行向量化加载，数据量必须是 4 的倍数才能进行高效的向量化读写。
 
 ---
 
 ## ⚙️ I. 核心目的：向上对齐到 4 的倍数
 
-$$\mathbf{size} = \text{size} + \mathbf{3} \rightarrow \text{size} \gg 2 \rightarrow \text{size} \ll 2$$
+size = size + 3 --> size >> 2 --> size << 2
 
 * **目标:** 确保 `size` 变量最终是 4 的倍数。
-* **为什么是 4？** 因为 $2^2 = 4$，位移操作 (`>> 2` 和 `<< 2`) 可以非常快地完成除法和乘法，并且专门针对 4 的倍数进行操作。
+* **为什么是 4？** 因为 2^2 = 4，位移操作 (`>> 2` 和 `<< 2`) 可以非常快地完成除法和乘法，并且专门针对 4 的倍数进行操作。
 
 ---
 
 ## 🔢 II. 步骤分解与示例
 
-假设我们有一个 $N$ 个点的三维点云。总的浮点数数量是 $n \times 3$。
+假设我们有一个 N 个点的三维点云。总的浮点数数量是 n  *  3。
 
-| 初始 $\mathbf{n}$ | 初始 $\mathbf{size} = \mathbf{n} \times 3$ | 步骤 1: 加 3 ($\mathbf{size} + 3$) | 步骤 2: 右移 2 ($\mathbf{\gg 2}$) | 步骤 3: 左移 2 ($\mathbf{\ll 2}$) | 最终 $\mathbf{size}$ (对齐值) |
+| 初始 n | 初始 size = n  *  3 | 步骤 1: 加 3 (size + 3) | 步骤 2: 右移 2 (>> 2) | 步骤 3: 左移 2 (<< 2) | 最终 size (对齐值) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **A. 完美对齐** (4 个点) | $4 \times 3 = \mathbf{12}$ | $12 + 3 = 15$ | $15 / 4 = \mathbf{3}$ | $3 \times 4 = \mathbf{12}$ | 12 |
-| **B. 需对齐** (5 个点) | $5 \times 3 = \mathbf{15}$ | $15 + 3 = 18$ | $18 / 4 = \mathbf{4}$ | $4 \times 4 = \mathbf{16}$ | 16 |
-| **C. 需对齐** (6 个点) | $6 \times 3 = \mathbf{18}$ | $18 + 3 = 21$ | $21 / 4 = \mathbf{5}$ | $5 \times 4 = \mathbf{20}$ | 20 |
+| **A. 完美对齐** (4 个点) | 4  *  3 = 12 | 12 + 3 = 15 | 15 / 4 = 3 | 3  *  4 = 12 | 12 |
+| **B. 需对齐** (5 个点) | 5  *  3 = 15 | 15 + 3 = 18 | 18 / 4 = 4 | 4  *  4 = 16 | 16 |
+| **C. 需对齐** (6 个点) | 6  *  3 = 18 | 18 + 3 = 21 | 21 / 4 = 5 | 5  *  4 = 20 | 20 |
 
-### 步骤 1: 加 3 ($\mathbf{size} + 3$)
+### 步骤 1: 加 3 (size + 3)
 
-$$\mathbf{size}_{\text{temp}} = \mathbf{size} + 3$$
+size_{temp = size + 3
 
-* **目的:** 这一步是向上取整的关键。如果 $\mathbf{size}$ 已经是 4 的倍数（例如 12），加 3 后变为 15。如果 $\mathbf{size}$ 不是 4 的倍数（例如 15），加 3 后变为 18。
+* **目的:** 这一步是向上取整的关键。如果 size 已经是 4 的倍数（例如 12），加 3 后变为 15。如果 size 不是 4 的倍数（例如 15），加 3 后变为 18。
 
-### 步骤 2: 右移 2 ($\mathbf{\gg 2}$)
+### 步骤 2: 右移 2 (>> 2)
 
-$$\mathbf{size}_{\text{div}} = \mathbf{size}_{\text{temp}} \gg 2$$
+size_{div = size_{temp >> 2
 
 * **目的:** 位移 `>> 2` 等同于 **除以 4** 并取整数部分（向下取整）。
 
 | 初始 size | size + 3 | 除以 4 结果 | 含义 |
 | :--- | :--- | :--- | :--- |
-| 12 (对齐) | 15 | $15 / 4 = \mathbf{3}$ | 得到 $\mathbf{12 / 4 = 3}$ |
-| 15 (需对齐) | 18 | $18 / 4 = \mathbf{4}$ | 实现了 $\mathbf{15 / 4}$ **向上取整**得到 4。 |
-| 18 (需对齐) | 21 | $21 / 4 = \mathbf{5}$ | 实现了 $\mathbf{18 / 4}$ **向上取整**得到 5。 |
+| 12 (对齐) | 15 | 15 / 4 = 3 | 得到 12 / 4 = 3 |
+| 15 (需对齐) | 18 | 18 / 4 = 4 | 实现了 15 / 4 **向上取整**得到 4。 |
+| 18 (需对齐) | 21 | 21 / 4 = 5 | 实现了 18 / 4 **向上取整**得到 5。 |
 
-### 步骤 3: 左移 2 ($\mathbf{\ll 2}$)
+### 步骤 3: 左移 2 (<< 2)
 
-$$\mathbf{size}_{\text{final}} = \mathbf{size}_{\text{div}} \ll 2$$
+size_{final = size_{div << 2
 
 * **目的:** 位移 `<< 2` 等同于 **乘以 4**。它将上一步的结果恢复为最终的字节/元素数。
-* **结果:** $4 \times (\text{向上取整结果})$。最终结果一定是 4 的倍数。
+* **结果:** 4  *  (向上取整结果)。最终结果一定是 4 的倍数。
 
 ---
 
@@ -329,25 +393,25 @@ question5:
         const float4* bp = (const float4*)(&pts[i]);
         float4* bc = (float4*)(&cached_pts[i]);
         bc[0] = bp[0];
-    }
+    
 
 这是一个关于 **GPU 内存访问优化**和 **非对齐数据处理** 的经典问题。您的疑问触及了高性能 CUDA 编程中，如何在处理三维数据时进行 **向量化 (Vectorization)** 和 **填充 (Padding)** 的关键技巧。
 
 -----
 
-## ⚙️ I. 核心问题：3D 数据与 $\mathbf{float4}$ 的冲突
+## ⚙️ I. 核心问题：3D 数据与 float4 的冲突
 
 ### 1\. 为什么是 3 个 float？
 
-  * **原因:** 点云数据是三维空间坐标 $P_i = (x_i, y_i, z_i)$。每个点自然需要 **3 个 float**。
+  * **原因:** 点云数据是三维空间坐标 P_i = (x_i, y_i, z_i)。每个点自然需要 **3 个 float**。
 
-### 2\. 为什么用 $\mathbf{float4}$？
+### 2\. 为什么用 float4？
 
-  * **原因:** `float4` (16 字节) 是 GPU 上最高效的内存访问单位。使用 $\mathbf{float4}$ 可以在一次事务中读取 4 个 `float`，极大提升内存带宽利用率 (**内存合并/Coalescing**)。
+  * **原因:** `float4` (16 字节) 是 GPU 上最高效的内存访问单位。使用 float4 可以在一次事务中读取 4 个 `float`，极大提升内存带宽利用率 (**内存合并/Coalescing**)。
 
-### 3\. 冲突:\*\* $3 \times N$ 几乎不可能被 4 整除。
+### 3\. 冲突:\*\* 3  *  N 几乎不可能被 4 整除。
 
-  * **结果:** 除非点的个数 $N$ 是 4 的倍数，否则 $\mathbf{N \times 3}$ 的总元素数几乎总是不被 4 整除，直接进行 $\mathbf{float4}$ 访问会导致越界或效率低下。
+  * **结果:** 除非点的个数 N 是 4 的倍数，否则 N  *  3 的总元素数几乎总是不被 4 整除，直接进行 float4 访问会导致越界或效率低下。
 
 -----
 
@@ -355,9 +419,9 @@ question5:
 
 代码正是通过 **牺牲少量内存空间** 来解决这个问题的。
 
-### A. 解决非对齐问题 (代码 2: $\mathbf{size = (\dots) \ll 2}$ )
+### A. 解决非对齐问题 (代码 2: size = (...) << 2 )
 
-这段代码的核心是 **向上对齐到 4 的倍数**，以安全地使用 $\mathbf{float4}$。
+这段代码的核心是 **向上对齐到 4 的倍数**，以安全地使用 float4。
 
 ```c
 // size = n * 3 (总元素数)
@@ -367,40 +431,40 @@ size = ((size + 3) >> 2) << 2; // 向上对齐到最接近的 4 的倍数
 
 #### 示例：非对齐数据的处理
 
-假设 $\mathbf{n}=5$ 个点。总元素数 $\mathbf{size}=15$。
+假设 n=5 个点。总元素数 size=15。
 
 | 元素 | 索引 | 坐标 | 物理位置 |
 | :--- | :--- | :--- | :--- |
-| $P_4.z$ | 14 | $z_4$ | **有效数据结束** |
+| P_4.z | 14 | z_4 | **有效数据结束** |
 | **填充** | 15 | (垃圾值) | **填充的 1 个 float** |
 
-  * **对齐后的 $\mathbf{size}$:** 变成 $\mathbf{16}$。
-  * **`load_pts` 循环:** 循环现在会执行到 $i < 16$。线程会尝试加载索引 15 的数据。
-  * **写入共享内存:** 线程会将 $P_4.z$ (索引 14)、**以及一个额外的、无用的填充值 (索引 15)**，安全地加载到共享内存。
+  * **对齐后的 size:** 变成 16。
+  * **`load_pts` 循环:** 循环现在会执行到 i < 16。线程会尝试加载索引 15 的数据。
+  * **写入共享内存:** 线程会将 P_4.z (索引 14)、**以及一个额外的、无用的填充值 (索引 15)**，安全地加载到共享内存。
 
-> **结论:** 这种对齐确保了所有线程都使用高效的 $\mathbf{float4}$ 指令进行加载，即使这意味着我们要加载和存储 1 个（或 2 个）无用的 $float$。
+> **结论:** 这种对齐确保了所有线程都使用高效的 float4 指令进行加载，即使这意味着我们要加载和存储 1 个（或 2 个）无用的 float。
 
-### B. 向量化加载 (代码 2: $\mathbf{bc[0] = bp[0]}$)
+### B. 向量化加载 (代码 2: bc[0] = bp[0])
 
 ```c
 for(int i = threadIdx.x * 4; i < size; i += blockDim.x * 4){
     const float4* bp = (const float4*)(&pts[i]); // Source (Global)
     float4* bc = (float4*)(&cached_pts[i]); // Destination (Shared)
     bc[0] = bp[0];
-}
+
 ```
 
-  * **步长:** $\mathbf{i}$ 的步长是 $\mathbf{blockDim.x} \times 4$。这个 **$\mathbf{\times 4}$** 是因为每次迭代加载 4 个 $float$。
-  * **操作:** `bc[0] = bp[0]` 是向量化赋值。一个线程在一次操作中将 **4 个 $float$** 从全局内存复制到共享内存。
+  * **步长:** i 的步长是 blockDim.x  *  4。这个 ** *  4** 是因为每次迭代加载 4 个 float。
+  * **操作:** `bc[0] = bp[0]` 是向量化赋值。一个线程在一次操作中将 **4 个 float** 从全局内存复制到共享内存。
 
-### C. 解决索引偏移 (代码 1: $\mathbf{points + b\_start * 3}$)
+### C. 解决索引偏移 (代码 1: points + b_start * 3)
 
 ```c
 load_pts(points + b_start * 3, cached_other_pts, b_size);
 ```
 
-  * **作用:** 尽管数据在内存中是 $x, y, z$ 排列，但 Kernel 在计算起始地址时，仍然使用 $3$ 作为乘数 ($\mathbf{b\_start} * 3$)。
-  * **目的:** $\mathbf{b\_start} * 3$ 计算出第 $\mathbf{b\_start}$ 个点的 $x$ 坐标在数组中的偏移量。**`load_pts` 函数随后负责处理其中的 3D 到 4D 的对齐和加载。**
+  * **作用:** 尽管数据在内存中是 x, y, z 排列，但 Kernel 在计算起始地址时，仍然使用 3 作为乘数 (b_start * 3)。
+  * **目的:** b_start * 3 计算出第 b_start 个点的 x 坐标在数组中的偏移量。**`load_pts` 函数随后负责处理其中的 3D 到 4D 的对齐和加载。**
 
 -----
 
@@ -408,8 +472,8 @@ load_pts(points + b_start * 3, cached_other_pts, b_size);
 
 | 代码部分 | 目的 | 为什么要这样做？ |
 | :--- | :--- | :--- |
-| $\mathbf{size = (\dots) \ll 2}$ | **安全对齐** | 保证 `size` 是 4 的倍数，以安全使用 $\mathbf{float4}$ 向量。 |
-| $\mathbf{bc[0] = bp[0]}$ | **向量化加载** | 牺牲 1-2 个 $float$ 的空间，换取 $\mathbf{4}$ 倍的内存带宽效率。 |
+| size = (...) << 2 | **安全对齐** | 保证 `size` 是 4 的倍数，以安全使用 float4 向量。 |
+| bc[0] = bp[0] | **向量化加载** | 牺牲 1-2 个 float 的空间，换取 4 倍的内存带宽效率。 |
 
 在 GPU 编程中，时间比空间宝贵，所以我们宁愿浪费一点内存来存储填充值，也要确保内存操作是最高效的。
 //--------------------------------------------------------------------------------------------------
