@@ -29,8 +29,11 @@ __global__ void subarray_sum_2d(const int* input, int* output, int N, int M, int
         if(p < j){
             Ms[p] += Ms[p + j];
         }
+        //correct
         __syncthreads();
     }
+    //wrong
+    __syncthreads();
 
     if(p == 0){
         atomicAdd(output, Ms[0]);
@@ -51,7 +54,6 @@ extern "C" void solve(const int* input, int* output, int N, int M, int S_ROW, in
     );
 
 }
-
 
 
 //--------------------------------------------------------------------------------------------------
@@ -185,6 +187,88 @@ question1:
 
 不理解，请解释，用例子
 
+why this is correct:
+    int p = threadIdx.y * TILE_X + threadIdx.x;
+    for(int j = TILE_X * TILE_Y / 2; j > 0; j >>= 1){
+        if(p < j){
+            Ms[p] += Ms[p + j];
+        }
+        __syncthreads();
+    }
+
+but this is wrong
+    int p = threadIdx.y * TILE_X + threadIdx.x;
+    for(int j = TILE_X * TILE_Y / 2; j > 0; j >>= 1){
+        if(p < j){
+            Ms[p] += Ms[p + j];
+        }
+    }
+    __syncthreads();
+
+
+answer:
+That's an excellent question that highlights the absolute necessity of **synchronization** in collaborative parallel algorithms like **Reduction**.
+
+The first code block is **correct** because it uses `__syncthreads()` inside the loop, guaranteeing **data integrity** at every stage of the parallel reduction. The second code block is **wrong** because the lack of synchronization causes **data races** and **unpredictable results**.
+
+Here is a breakdown of why synchronization is mandatory in the parallel reduction loop.
+
+-----
+
+## 1\. 🎯 The Goal: Parallel Tree Reduction
+
+The code implements a **Tree Reduction** algorithm in shared memory. The goal is to sum 1024 values (stored in Ms[0] to Ms[1023]) into a single value (Ms[0]) in \log_2(1024) = 10 steps.
+
+  * In each step (j), threads simultaneously read data from Ms[p] and Ms[p+j] and write the result back to Ms[p].
+  * The array \mathbf{Ms} is **Shared Memory**, meaning all threads read from and write to the same physical memory space.
+
+-----
+
+## 2\. ❌ Why the Second Block is WRONG (Data Race)
+
+In the second code block, where `__syncthreads()` is *outside* the loop:
+
+c
+// WRONG: Synchronization happens only once at the end
+for(int j = TILE_X * TILE_Y / 2; j > 0; j >>= 1){
+    if(p < j){
+        Ms[p] += Ms[p + j]; // Threads read and write without coordination
+    }
+}
+__syncthreads(); // Too late!
+
+
+**The Problem:** **Data Race Condition**
+
+1.  **Step 1:** Let j=512. Thread p=0 reads Ms[0] and Ms[512]. Thread p=511 reads Ms[511] and Ms[1023]. They compute and write back to their respective Ms[p].
+2.  **Step 2:** j becomes 256. Threads now try to read the **new** values computed in Step 1.
+3.  **The Failure:** The GPU scheduler (Warp Scheduler) might execute the instruction for thread p=100 (which is reading Ms[356] in Step 2) *before* thread p=356 has finished writing its result from Step 1.
+      * Since there is no guarantee that all Step 1 writes are complete before Step 2 reads begin, threads will likely read **stale or partially written data**.
+      * The final sum Ms[0] will be incorrect and non-deterministic (it changes every time you run the code).
+
+-----
+
+## 3\. ✅ Why the First Block is CORRECT (Synchronization)
+
+In the first code block, `__syncthreads()` is **inside** the loop:
+
+c
+for(int j = TILE_X * TILE_Y / 2; j > 0; j >>= 1){
+    if(p < j){
+        Ms[p] += Ms[p + j];
+    }
+    __syncthreads(); // MANDATORY synchronization point
+}
+
+
+**The Solution:** **Barrier Synchronization**
+
+1.  **Start of Loop (Step J):** All threads are synchronized.
+2.  **Computation:** Threads read Ms[p] and Ms[p+j], compute the sum, and write back to Ms[p].
+3.  **`__syncthreads()`:** This barrier forces **all threads in the Block** to wait until **every single thread has finished its write operation** for Step J.
+4.  **Next Step (Step J/2):** When the loop continues to j/2, all threads are guaranteed to be reading the **latest, complete, and correct** results from the previous step.
+
+**Conclusion:** The `__syncthreads()` inside the loop creates the **parallel execution barrier** necessary for the collaborative tree reduction to work correctly, preventing data races and ensuring the final result is the true sum.
 
 //--------------------------------------------------------------------------------------------------
 
