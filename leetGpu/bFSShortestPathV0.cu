@@ -1,5 +1,105 @@
 
+#include <cuda_runtime.h>
+#include <stdio.h>
 
+__device__ const int DX[] = {0, 0, +1, -1};
+__device__ const int DY[] = {-1, +1, 0, 0};
+
+__global__ void move_kernel(
+    const int* grid, int* dist, int rows, int cols, 
+    const int *wave, int *wave_len, int *next_wave, int *next_wave_len
+) {
+    const int i = threadIdx.x + blockDim.x * blockIdx.x;
+    
+    if (i >= *wave_len) return;
+
+    const int x = wave[2 * i];
+    const int y = wave[2 * i + 1];
+
+    const int idx = x * cols + y;
+    const int next_dist = 1 + dist[idx];
+
+    for (int i = 0 ; i < 4 ;i++ ){
+        int nx = x + DX[i], ny = y + DY[i];
+        const int nidx = nx * cols + ny;
+        if (0 <= nx && 0 <= ny && nx < rows && ny < cols && !grid[nidx]) {
+            //printf("will move (%d, %d) -> (%d, %d)\n", x, y, nx, ny);
+            if(next_dist < atomicMin(dist + nidx, next_dist)) { // if we discovered the next node
+                int loc = atomicAdd(next_wave_len, 1); // add it to the next wave
+                next_wave[2 * loc] = nx;
+                next_wave[2 * loc + 1] = ny;
+            }
+        }
+    }
+}
+
+__host__ void debugDist(int *dist, int rows, int cols) {
+    int *h_dist = new int[rows * cols];
+    cudaMemcpy(h_dist, dist, sizeof(int) * rows * cols, cudaMemcpyDeviceToHost);
+    for (int i = 0 ; i < rows * cols; i++) {
+        if (h_dist[i] <= rows * cols)
+            printf("%d ", h_dist[i]);
+        else 
+            printf("inf ");
+    }
+    printf("\n");
+    delete[] h_dist;
+}
+
+__global__ void map_inf_to_neg_kernel(int *grid, int rows, int cols) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= rows * cols) return;
+    if (grid[i] > rows * cols) grid[i] = -1;
+}
+
+// grid, result are device pointers
+extern "C" void solve(const int* grid, int* result, int rows, int cols, 
+                     int start_row, int start_col, int end_row, int end_col) {
+    const dim3 numThreads(128);
+    const dim3 numBlocks((rows * cols + numThreads.x - 1) / numThreads.x);
+
+    int *dist;
+
+    cudaMalloc(&dist, rows * cols * sizeof(int));
+    cudaMemset(dist, 0x63, rows * cols * sizeof(int)); // set initial distances to high values, too lazy to write a separate kernel for that
+    cudaMemset(dist + start_row * cols + start_col, 0, sizeof(int)); // set initial distance to 0 only for start vertex
+    
+    int *wave[2];
+
+    cudaMalloc(&wave[0], sizeof(int) + rows * cols * 2 * sizeof(int)); // extra int for length
+    cudaMalloc(&wave[1], sizeof(int) + rows * cols * 2 * sizeof(int));
+
+    int init_wave_len = 1;
+    
+    cudaMemcpy(wave[0], &init_wave_len, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(wave[0]+1, &start_row, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(wave[0]+2, &start_col, sizeof(int), cudaMemcpyHostToDevice);
+
+    int wave_id = 0;
+    int h_next_wave_len;
+
+    do {
+        int current = wave_id % 2;
+        int alt = (wave_id + 1) % 2;
+        cudaMemset(wave[alt], 0, sizeof(int)); // reset next wave len
+        move_kernel<<<numBlocks, numThreads>>>(
+            grid, dist, rows, cols,
+            wave[current] + 1, wave[current],
+            wave[alt] + 1, wave[alt]
+        );
+        cudaMemcpy(&h_next_wave_len, wave[alt], sizeof(int), cudaMemcpyDeviceToHost);
+        wave_id++;
+        //printf("wave#%d will have length: %d\n", wave_id, h_next_wave_len);
+    } while (h_next_wave_len > 0);
+
+    map_inf_to_neg_kernel<<<numBlocks, numThreads>>>(dist, rows, cols);
+
+    // debugDist(dist, rows, cols);
+
+    cudaMemcpy(result, dist + end_row * cols + end_col, sizeof(int), cudaMemcpyDeviceToDevice);
+
+    cudaFree(dist); // be nice
+}
 
 
 
@@ -8,7 +108,116 @@
 question0:
 不理解，请解释，用例子
 
+这段代码实现了一个基于 **GPU 并行广度优先搜索 (Parallel Breadth-First Search, BFS)** 的最短路径算法。它利用 CUDA 来在网格 (grid) 上寻找从一个起始点 (start_row, start_col) 到一个终点 (end_row, end_col) 的最短路径。
 
+该算法的核心是 **波前推进 (Wavefront Progression)** 模式，即在每一步迭代中，同时探索当前波前（Wave）的所有相邻节点。
+
+-----
+
+## ⚙️ I. 核心概念与数据结构
+
+### 1. BFS / 波前推进
+
+  * **传统 BFS:** 使用队列，逐个节点探索。
+  * **并行 BFS:** 在 GPU 上，使用 wave 数组存储当前波前所有待探索的节点。每一步迭代，所有线程同时处理 wave 数组中的一个节点，并行生成下一波前 (next_wave)。
+
+### 2. 关键数据
+
+| 变量 | 类型/位置 | 作用 |
+| :--- | :--- | :--- |
+| grid | `const int*` (Device) | 输入网格。`grid[idx]` 为 0 表示可通行，非 0 表示障碍。 |
+| dist | `int*` (Device) | 距离数组。dist[idx] 存储从起点到该点的**最短距离**。 |
+| wave[2] | `int*` (Device) | **双缓冲**：存储当前波前和下一波前的节点坐标。 |
+| wave_len | `int*` (Device/Host) | 存储波前数组的实际长度。**存储在 wave 数组的第一个元素位置**。 |
+| **DX/DY** | `__device__ const int[]` | 偏移数组，用于检查上、下、左、右四个邻居。 |
+
+-----
+
+## 🚀 II. Kernel 内部流程 (`move_kernel`)
+
+该 Kernel 是并行 BFS 的主要工作单元。每个线程处理当前波前中的一个节点。
+
+### 1. 线程分工与坐标提取
+
+c
+const int i = threadIdx.x + blockDim.x * blockIdx.x; // 线程的全局索引
+if (i >= *wave_len) return; // 边界检查：线程只处理 wave 数组中的有效节点
+
+const int x = wave[2 * i];       // 当前节点的行坐标
+const int y = wave[2 * i + 1];   // 当前节点的列坐标
+const int idx = x * cols + y;
+const int next_dist = 1 + dist[idx]; // 邻居节点的理论距离
+
+
+  * **波前索引 (i):** 线程 ID 直接对应 wave 数组中的一个节点索引。
+  * **坐标提取:** 由于 wave 数组存储的是 [x_0, y_0, x_1, y_1, ...] 格式，需要乘以 2 来获取正确的 x 坐标。
+
+### 2. 探索邻居与合法性检查
+
+c
+for (int i = 0 ; i < 4 ;i++ ){ // 循环遍历 4 个方向（上、下、左、右）
+    int nx = x + DX[i], ny = y + DY[i];
+    const int nidx = nx * cols + ny;
+
+    if (0 <= nx && 0 <= ny && nx < rows && ny < cols && !grid[nidx]) {
+        // 检查：1. 是否在网格内；2. 是否不是障碍物 (!grid[nidx])
+        // ...
+    
+
+
+
+  * **循环:** 遍历 DX 和 DY 数组，检查 4 个邻居 nx, ny)。
+  * **合法性检查:** 确保邻居在网格边界内，并且不是障碍物（`grid[nidx]` 为 0）。
+
+### 3. 最短距离更新与下一波前生成（核心）
+
+c
+// ... (在合法邻居的 if 块内)
+if(next_dist < atomicMin(dist + nidx, next_dist)) { // 尝试更新最短距离
+    int loc = atomicAdd(next_wave_len, 1); // 成功更新，加入下一波前
+    next_wave[2 * loc] = nx;
+    next_wave[2 * loc + 1] = ny;
+
+
+
+  * **atomicMin(dist + nidx, next_dist):** 这是关键的**原子操作**。它尝试将 dist[nidx] 更新为新的、更短的距离 next_dist。
+      * **返回值:** `atomicMin` 返回 **原值**。
+      * **判断:** 如果 **新的距离 next_dist** 小于 **返回的原值**，说明这次更新是成功的（即发现了一条更短的路径）。
+  * **atomicAdd(next_wave_len, 1):** 如果成功更新距离，说明 (nx, ny) 是下一波前的一个新节点。
+      * atomicAdd 返回下一波前数组的**当前长度**（即新节点的位置 loc）。
+      * loc 随后用于写入 next_wave 数组。
+
+-----
+
+## 💻 III. 主机端求解 (`solve` 函数)
+
+### 1. 初始化
+
+c
+cudaMemset(dist, 0x63, rows * cols * sizeof(int)); // 初始化距离为极大值
+cudaMemset(dist + start_row * cols + start_col, 0, sizeof(int)); // 起点距离设为 0
+// ...
+// wave[0] 存储初始波前 (只包含起点)
+
+
+### 2. 迭代波前推进 (主循环)
+
+c
+do {
+    // ...
+    move_kernel<<<numBlocks, numThreads>>>(...); // 启动 Kernel
+    cudaMemcpy(&h_next_wave_len, wave[alt], sizeof(int), cudaMemcpyDeviceToHost); // 获取下一波前长度
+    wave_id++;
+ while (h_next_wave_len > 0); // 只要下一波前非空，就继续迭代
+
+
+  * **双缓冲:** 循环利用 wave[0] 和 wave[1] 两个数组交替作为当前波前和下一波前，实现高效的读写分离。
+  * **终止条件:** 当下一波前长度 (h_next_wave_len) 为 0 时，说明所有可达节点都已被探索，BFS 结束。
+
+### 3. 最终结果
+
+  * `map_inf_to_neg_kernel`: 将距离数组中未被访问到的极大值（相当于 \infty）映射为 -1。
+  * `cudaMemcpy(result, dist + end_row * cols + end_col, ...)`: 将终点 end_row, end_col) 的最短距离从 dist 数组中取出，作为最终结果返回。
 
 //--------------------------------------------------------------------------------------------------
 
@@ -20,6 +229,84 @@ question1:
 不理解，请解释，用例子
 
 
+
+    cudaMalloc(&wave[0], sizeof(int) + rows * cols * 2 * sizeof(int)); // extra int for length
+    cudaMalloc(&wave[1], sizeof(int) + rows * cols * 2 * sizeof(int));
+不理解，请解释，用例子
+
+    int init_wave_len = 1;
+    
+    cudaMemcpy(wave[0], &init_wave_len, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(wave[1], &start_row, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(wave[2], &start_col, sizeof(int), cudaMemcpyHostToDevice);
+
+
+answer:
+您问到的这段代码是并行广度优先搜索（BFS）算法中，**双缓冲（Double Buffering）波前数组**的分配和初始化的关键步骤。
+
+核心在于理解 wave[0] 和 wave[1] 数组的结构和用途，以及为什么它们在内存中存储了长度信息。
+
+-----
+
+## ⚙️ I. 核心结构：双缓冲波前数组
+
+在并行 BFS 中，我们需要两个 GPU 数组来存储当前正在探索的节点和下一个将要探索的节点，以避免读写冲突。
+
+### 1. 内存分配 (`cudaMalloc`)
+
+c
+cudaMalloc(&wave[0], sizeof(int) + rows * cols * 2 * sizeof(int)); // wave[0] 的分配
+// wave[1] 的分配类似
+
+
+  * **`wave[0]` 和 `wave[1]`:** 这是两个独立的 GPU 指针，用于实现 Ping-Pong 机制。
+  * **计算总字节数:**
+      * rows * cols：网格中的总节点数。
+      * * 2 * sizeof(int)：每个节点需要 2 个 `int` 来存储坐标 (x, y)。
+      * + sizeof(int)：**额外的 1 个 `int`**，用于存储**数组的当前有效长度** (wave_len)。
+
+> **总结：** 每个 `wave` 数组的内存布局是：`[ 数组长度 (wave_len) | x0 | y0 | x1 | y1 | ... ]`
+
+### 2. 为什么需要 wave_len 存储在数组内部？
+
+  * 在 Kernel (`move_kernel`) 中，我们需要知道当前波前数组的有效长度 (`*wave_len`) 来控制线程的数量 (`if (i >= *wave_len) return;`)。
+  * 同时，我们也需要写入下一波前数组的长度 (`atomicAdd(next_wave_len, 1)`。
+  * 将长度存储在数组的 **起始位置** (wave[i][0]) 是一种高效的惯例，允许我们在 Kernel 中使用 **原子操作** (`atomicAdd`) 来更新下一波前的长度，无需额外的全局内存分配。
+
+-----
+
+## 🔢 II. 初始波前设置 (Start Node)
+
+初始化步骤是将起点 start_row, start_col) 放入波前数组 wave[0] 中，并设置其长度。
+
+假设：
+
+  * start_row = 5
+  * start_col = 10
+  * init_wave_len = 1
+
+| 内存操作 | 源数据 | 目标地址 | 存储内容 |
+| :--- | :--- | :--- | :--- |
+| `cudaMemcpy(wave[0], &init_wave_len, ...)` | 1 | wave[0] 的起始地址 | **数组长度 (wave_len)** |
+| `cudaMemcpy(wave[1], &start_row, ...)` | 5 | wave[0] + sizeof(int) * 1 | **第一个节点 X 坐标 (x0)** |
+| `cudaMemcpy(wave[2], &start_col, ...)` | 10 | wave[0] + sizeof(int) * 2 | **第一个节点 Y 坐标 (y0)** |
+
+> **注意：** `wave[1]` 和 `wave[2]` 在 C 语言中是错误的写法（因为 `wave` 是一个数组，不是一个指针）。但根据上下文，这三行代码的意图是将 start_row, start_col) 坐标写入 wave[0] 数组中，紧跟在长度之后。
+
+### 数组 wave[0] 在 GPU 内存中的布局:
+
+| 内存索引 (以 `int` 为单位) | 存储值 | 作用 |
+| :--- | :--- | :--- |
+| **0** | **1** | wave_len (当前波前长度) |
+| **1** | **5** | x_0 (start_row) |
+| **2** | **10** | y_0 (start_col) |
+| 3 | (空) | x_1 |
+| 4 | (空) | y_1 |
+| ... | ... | ... |
+
+**总结：** 这段初始化代码将 BFS 的起点安全地加载到了第一个波前数组中，并设置长度为 1，从而启动了整个并行 BFS 过程。
+
+
 //--------------------------------------------------------------------------------------------------
 
 
@@ -29,7 +316,59 @@ question2:
 
 不理解，请解释，用例子
 
+如果数组 wave[0] 在 GPU 内存中的布局:
 
+内存索引 (以 int 为单位)存储值作用01wave_len (当前波前长度)15x_0 (start_row)210y_0 (start_col)3(空)x_14(空)y_1.........
+
+那么
+    cudaMalloc(&wave[1], sizeof(int) + rows * cols * 2 * sizeof(int));
+中wave[1]的值是啥？
+
+answer:
+这是一个关于 **C 语言数组与指针** 以及 **`cudaMalloc`** 如何工作的技术问题。
+
+在您这段代码中，`wave` 是一个包含两个指针的数组，`wave[0]` 和 `wave[1]`。
+
+-----
+
+## ⚙️ I. 代码定义解析
+
+首先，`wave` 的定义和使用在 C 语言中存在歧义，但在 CUDA 上下文中，我们假设它被定义为：
+
+c
+int *wave[2]; // wave 是一个包含两个 int* 指针的数组
+
+
+### 1. `cudaMalloc` 的作用
+
+`cudaMalloc(&wave[1], size)` 函数执行以下操作：
+
+1.  在 GPU 的全局内存 (Global Memory) 中找到一块足够大的连续内存空间。
+2.  将这块新分配的 **GPU 内存的起始地址** 赋值给主机端的指针变量 **`wave[1]`**。
+
+### 2. `wave[1]` 的值
+
+因此，`wave[1]` 的值是：
+
+**`wave[1]` 的值是 GPU 内存中一块新分配的、起始地址较高的整数地址。**
+
+  * **类型:** 它是 `int*` (指向 GPU 内存的指针)。
+  * **值:** 一个 64 位整数，代表 GPU 上的虚拟地址。
+
+-----
+
+## 🚀 II. 与 `wave[0]` 的关系
+
+| 指针 | 作用 | 内容 (值) |
+| :--- | :--- | :--- |
+| **`wave`** | 主机端数组 | 存储着两个 GPU 地址。 |
+| **`wave[0]`** | GPU 内存地址 1 | 指向 GPU 内存中存储波前数据的第一个缓冲区 (Buffer 0)。 |
+| **`wave[1]`** | GPU 内存地址 2 | 指向 GPU 内存中存储波前数据的第二个缓冲区 (Buffer 1)。 |
+
+**关键点：**
+
+  * **`wave[0]` 和 `wave[1]` 都是独立的 GPU 地址。** 它们指向两块物理上不连续的 GPU 内存区域，各自用于存储一个完整的波前数组 (包括长度和坐标)。
+  * **`wave[1]` 的值** 就是 CUDA 运行时系统为第二个波前缓冲区分配的起始地址。
 
 //--------------------------------------------------------------------------------------------------
 
@@ -41,7 +380,76 @@ question3:
 
 不理解，请解释，用例子
 
+这3个值是在&wave[0]，还是&wave[1]？
+    cudaMemcpy(wave[0], &init_wave_len, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(wave[1], &start_row, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(wave[2], &start_col, sizeof(int), cudaMemcpyHostToDevice);
 
+answer:
+这是一个非常好的技术性观察。根据您提供的代码和 C/CUDA 的指针规则，这三个值 **都被写入了第一个波前数组的内存区域，即 `wave[0]` 所指向的 GPU 内存地址，但写入的指针表达方式在 C 语法上是误导性的。**
+
+-----
+
+## ⚙️ 为什么所有的值都在 wave[0] 的内存区域？
+
+在您提供的 `solve` 函数中，`wave` 数组的初始化是这样的：
+
+c
+// 假设 wave 被定义为 int *wave[2]; (包含两个 GPU 地址的数组)
+
+// wave[0] 分配了足够的空间来存储 [长度] 和 [坐标]
+cudaMalloc(&wave[0], sizeof(int) + rows * cols * 2 * sizeof(int));
+// wave[1] 分配了第二个独立的缓冲区
+cudaMalloc(&wave[1], sizeof(int) + rows * cols * 2 * sizeof(int));
+
+// ... 随后进行数据拷贝 ...
+
+
+### 1. wave[0] 的内存布局 (目标)
+
+`wave[0]` 指向的 GPU 内存区域是用于存储 **第一个波前 (Wave 0)** 的数据的。其结构是：
+
+| 内存索引 (int) | 作用 |
+| :--- | :--- |
+| **wave[0] + 0** | 存储波前长度 (init_wave_len) |
+| **wave[0] + 1** | 存储 x_0 坐标 (start_row) |
+| **wave[0] + 2** | 存储 y_0 坐标 (start_col) |
+
+### 2. 代码的实际执行 (语法问题)
+
+您的三行 `cudaMemcpy` 代码的**意图**是按顺序写入这三个位置，但它使用了在标准 C/C++ 中对数组的**错误索引**方式：
+
+  * **第一行：** cudaMemcpy(wave[0], ...)
+
+      * `wave[0]` 是一个 `int*` 指针。它将 `init_wave_len` 写入地址 `wave[0]`，即 **索引 0**。
+
+  * **第二行：** cudaMemcpy(wave[1], ...)
+
+      * **这是错误的 C 语言指针用法！** 这里的 `wave[1]` 指向的是**第二个独立的波前缓冲区**的起始地址。
+      * **开发者真正的意图是：** 写入 **`wave[0]` 所指向的内存的索引 1 处**。
+      * **正确的写法应该是：** `cudaMemcpy(wave[0] + 1, &start_row, ...)`
+
+  * **第三行：** cudaMemcpy(wave[2], ...)
+
+      * **这是错误的 C 语言指针用法！**
+      * **开发者真正的意图是：** 写入 **`wave[0]` 所指向的内存的索引 2 处**。
+      * **正确的写法应该是：** `cudaMemcpy(wave[0] + 2, &start_col, ...)`
+
+### 结论：
+
+由于程序旨在初始化 **第一个波前 (`wave[0]`)**，我们可以推断开发者是想让这三个值连续存储在 wave[0] 内存区域中，作为起始节点 x, y 的坐标和波前长度。
+
+**三个值都属于 wave[0] 所指向的内存区域。**
+
+## 🔢 最终内存布局示例
+
+假设 `wave[0]` 的地址是 `0x4000` (GPU 内存)。
+
+| C 语法 (意图) | 目标地址 (物理) | 存储值 | 作用 |
+| :--- | :--- | :--- | :--- |
+| `wave[0]` | `0x4000` | init_wave_len (1) | **波前长度** |
+| `wave[0] + 1` | `0x4004` (错写为 `wave[1]`) | start_row (5) | **节点 X 坐标** |
+| `wave[0] + 2` | `0x4008` (错写为 `wave[2]`) | start_col (10) | **节点 Y 坐标** |
 
 
 //--------------------------------------------------------------------------------------------------
@@ -54,6 +462,69 @@ question4:
 
 不理解，请解释，用例子
 
+不理解，请解释，用例子
+
+    int wave_id = 0;
+    int h_next_wave_len;
+
+    do {
+        int current = wave_id % 2;
+        int alt = (wave_id + 1) % 2;
+        cudaMemset(wave[alt], 0, sizeof(int)); // reset next wave len
+        move_kernel<<<numBlocks, numThreads>>>(
+            grid, dist, rows, cols,
+            wave[current] + 1, wave[current],
+            wave[alt] + 1, wave[alt]
+        );
+        cudaMemcpy(&h_next_wave_len, wave[alt], sizeof(int), cudaMemcpyDeviceToHost);
+        wave_id++;
+        //printf("wave#%d will have length: %d\n", wave_id, h_next_wave_len);
+     while (h_next_wave_len > 0);
+
+answer:
+这段代码是并行广度优先搜索（BFS）算法在主机端（CPU）的核心**迭代循环**，实现了 **波前推进（Wavefront Progression）**。
+
+它的主要目的是：**不断地交替使用两个缓冲区（双缓冲），启动 Kernel，直到所有的可达节点都被探索完毕**。
+
+---
+
+## ⚙️ I. 核心机制：双缓冲（Ping-Pong）BFS
+
+并行 BFS 的关键挑战是：线程正在**读取**当前波前（Wave）时，不能让其他线程同时**写入**下一波前（Next Wave）。双缓冲解决了这个问题。
+
+### 1. 关键变量
+
+* **`wave_id` (0, 1, 2, ...):** 迭代计数器，决定当前是第几轮探索。
+* **`current` (wave_id mod 2):** 当前正在**读取**的波前（源）。
+* **`alt` ((wave_id + 1) mod 2):** 下一波前，是当前**写入**的目标缓冲区。
+* **`h_next_wave_len`:** 主机端的变量，用于接收下一波前的实际长度，作为终止条件。
+
+## 🚀 II. 迭代流程与示例
+
+假设我们正在网格上执行 BFS，目标是计算最短路径。
+
+| 步骤 | 代码 | 作用和状态 |
+| :--- | :--- | :--- |
+| **0. 初始化** | `wave_id = 0` | 初始波前 (Wave 0) 存储在 `wave[0]` 中，长度为 1。 |
+| **1. 缓冲区切换** | `current = 0`, `alt = 1` | **源:** `wave[0]` (当前波前)。 **目标:** `wave[1]` (下一波前)。 |
+| **2. 长度清零** | `cudaMemset(wave[alt], 0, sizeof(int));` | 将目标缓冲区 `wave[1]` 的**长度计数器**清零。必须清零，因为 `move_kernel` 会使用原子加法 (`atomicAdd`) 来累加新节点的数量。 |
+| **3. 启动 Kernel** | `move_kernel<<<...>>>(..., wave[current] + 1, wave[current], wave[alt] + 1, wave[alt]);` | **计算:** GPU 开始探索 `wave[current]` 中的所有节点。每发现一个新邻居，就使用 `atomicAdd` 将其坐标写入 `wave[alt] + 1`，并将 `wave[alt]`（长度）加 1。 |
+| **4. 检查终止** | `cudaMemcpy(&h_next_wave_len, wave[alt], sizeof(int), cudaMemcpyDeviceToHost);` | CPU 从 GPU 读取下一波前 (`wave[alt]`) 的**最终长度**。 |
+| **5. 迭代** | `wave_id++;` | `wave_id` 变为 1。 |
+| **6. 循环判断** | `while (h_next_wave_len > 0);` | **只要**下一波前有新节点（长度大于 0），就继续下一轮探索。 |
+
+### 示例（第 2 轮迭代）
+
+* **状态:** wave_id = 1。
+* **缓冲区切换:** `current = 1`，`alt = 0`。
+* **操作:**
+    * **源:** 读取 `wave[1]`（上一轮的结果）。
+    * **目标:** 写入 `wave[0]`。
+* **终止:** 如果 `h_next_wave_len` 最终为 0，说明当前波前没有发现任何新的、未探索的节点，算法收敛。
+
+## 🎯 总结
+
+这个 `do-while` 循环是并行 BFS 的**迭代引擎**。它通过不断切换 `wave[0]` 和 `wave[1]` 的角色，确保 GPU 始终在计算有效数据，而 `atomicAdd` 机制保证了多个线程可以安全地向下一波前添加节点。当整个图被遍历或无法找到新路径时，循环终止。 
 
 
 //--------------------------------------------------------------------------------------------------
@@ -64,6 +535,113 @@ question4:
 question5:
 
 不理解，请解释，用例子
+
+不理解，请解释，用例子
+
+__global__ void move_kernel(
+    const int* grid, int* dist, int rows, int cols, 
+    const int *wave, int *wave_len, int *next_wave, int *next_wave_len
+) {
+
+
+answer:
+这段代码是 **并行广度优先搜索 (Parallel Breadth-First Search, BFS)** 算法的核心 Kernel，名为 `move_kernel`。它的任务是让 GPU 上的每个线程同时探索当前波前 (wave) 中一个节点的所有相邻邻居，并生成下一波前 (next_wave)。
+
+-----
+
+## ⚙️ I. 线程分工与波前节点定位
+
+### 1. 线程到节点的映射
+
+c
+const int i = threadIdx.x + blockDim.x * blockIdx.x; // 线程的全局索引
+if (i >= *wave_len) return;
+
+
+  * **目标:** 线程 i 负责处理 wave 数组中的第 i 个节点。
+  * **`*wave_len`:** 这是当前波前中**有效节点**的总数（存储在 `wave` 数组指针指向的地址）。边界检查确保多余的线程退出。
+
+### 2. 坐标提取
+
+c
+const int x = wave[2 * i];
+const int y = wave[2 * i + 1];
+
+const int idx = x * cols + y;
+const int next_dist = 1 + dist[idx];
+
+
+  * **坐标提取:** wave 数组存储节点的坐标，格式为 [x_0, y_0, x_1, y_1, ...]。因此，线程 i 的 x 坐标在 2 * i 处，y 坐标在 2 * i + 1 处。
+  * **`idx`:** 当前节点 x, y) 在网格（`grid` 或 `dist`）中的一维索引。
+  * **`next_dist`:** 当前节点的最短距离 (dist[idx]) 加 1。这是到达任何邻居的**理论新距离**。
+
+> **示例:** 假设 wave = [5, 10, 8, 15, ...] (存储了两个节点的坐标：(5, 10) 和 (8, 15))。
+>
+>   * 线程 i=0 提取 x=5, y=10。
+>   * 线程 i=1 提取 x=8, y=15。
+
+-----
+
+## 🧭 II. 核心逻辑：探索与原子更新
+
+线程 i 现在遍历当前节点 x, y) 的四个邻居。
+
+### 1. 邻居和合法性检查
+
+c
+for (int i = 0 ; i < 4 ;i++ ){
+    int nx = x + DX[i], ny = y + DY[i]; // 计算邻居坐标
+    const int nidx = nx * cols + ny;
+
+    if (0 <= nx && 0 <= ny && nx < rows && ny < cols && !grid[nidx]) {
+        // 边界检查 && 障碍物检查 (!grid[nidx] 表示可通行)
+        // ...
+    
+
+
+
+### 2. 最短距离更新（原子操作）
+
+c
+if(next_dist < atomicMin(dist + nidx, next_dist)) { // 检查是否找到了更短的路径
+    // ...
+
+
+
+  * **机制:** 这是并行 BFS 的关键。`atomicMin(dist + nidx, next_dist)` 尝试将邻居节点 dist[nidx] 的值更新为 next_dist。
+      * **返回值:** `atomicMin` 返回 **原先存储在 dist[nidx] 中的值**。
+      * **判断:** 如果 next_dist 小于 `atomicMin` 返回的**原值**，说明我们刚刚发现了一条更短的路径（或者这是第一次访问该节点），更新成功，该邻居节点应该加入 next_wave。
+
+> **示例:**
+>
+> 1.  假设邻居距离 dist[nidx] **初始为 999** (\infty)。
+> 2.  线程计算 next_dist = 5。
+> 3.  `atomicMin` 返回 **999**。 5 < 999 为 **True**。更新成功，dist[nidx] 变为 5。
+
+### 3. 加入下一波前（原子操作）
+
+c
+int loc = atomicAdd(next_wave_len, 1); // 原子地增加下一波前长度
+next_wave[2 * loc] = nx;
+next_wave[2 * loc + 1] = ny;
+
+
+  * **机制:** atomicAdd(next_wave_len, 1) 安全地增加了下一波前的长度。它返回 **增加前** 的长度 loc，即新节点在 next_wave 数组中的**起始写入位置**。
+  * **写入:** 线程将新节点 nx, ny) 的坐标写入 next_wave 数组。
+
+> **示例:**
+>
+> 1.  假设 next_wave_len 当前为 10。
+> 2.  `atomicAdd` 返回 loc = 10。
+> 3.  新节点 nx, ny) 被写入 next_wave[20] 和 next_wave[21]。
+
+## 🎯 总结
+
+这个 Kernel 利用了 GPU 的大规模并行性和原子操作：
+
+1.  **并行性:** 所有线程同时探索当前波前。
+2.  **`atomicMin`:** 确保最短路径距离的更新是线程安全的。
+3.  **`atomicAdd`:** 确保多个线程可以安全地向下一波前添加新节点，而不会相互覆盖。
 
 
 //--------------------------------------------------------------------------------------------------
@@ -77,7 +655,69 @@ question6:
 
 不理解，请解释，有例子
 
+不理解，请解释，用例子
 
+__global__ void map_inf_to_neg_kernel(int *grid, int rows, int cols) {
+    const int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= rows * cols) return;
+    if (grid[i] > rows * cols) grid[i] = -1;
+
+
+answer:
+这段代码是一个非常简洁的 **CUDA Kernel**，用于在并行广度优先搜索 (BFS) 结束后进行**结果清理**。
+
+它的核心作用是：**将距离数组中所有表示“不可达”（即初始设置的极大值）的元素，统一修改为 -1。**
+
+-----
+
+## ⚙️ I. 核心目标：结果标准化
+
+### 1. 背景：最短路径距离数组 (dist)
+
+在 BFS 算法中，我们通常将起点到所有点的距离数组 (dist) 初始化为一个**极大值**（表示无穷大或不可达），然后在搜索过程中更新这些距离。
+
+  * **极大值 (\infty):** 在您的 `solve` 函数中，这是通过 `cudaMemset(dist, 0x63, ...)` 设置的。`0x63` 对应一个很大的整数值。
+  * **目标:** 搜索结束后，任何仍保持极大值的格子都意味着它**不可从起点到达**。我们需要将其标记为标准的 **-1**（通常表示不可达或未访问）。
+
+### 2. Kernel 的实际作用
+
+虽然 Kernel 传入的参数名是 `grid`，但根据其在 `solve` 函数中的调用位置 (`map_inf_to_neg_kernel(dist, rows, cols);`)，我们可以确定它实际操作的是 **dist 数组**。
+
+-----
+
+## 🚀 II. 执行流程与示例
+
+假设我们的网格是 4 * 4，共有 rows * cols = 16 个元素。
+
+### 1. 线程分工与索引计算
+
+c
+const int i = threadIdx.x + blockIdx.x * blockDim.x;
+if (i >= rows * cols) return;
+
+
+  * **i:** 线程的全局索引，范围从 0 到 15。每个线程 i 负责检查 dist 数组中的一个元素。
+  * **边界检查:** 确保线程不会访问超出 4 * 4 区域的内存。
+
+### 2. 核心条件判断
+
+c
+if (grid[i] > rows * cols) grid[i] = -1;
+
+
+  * **判断条件:** grid[i]（即 dist[i]）是否大于 rows * cols (16)。
+  * **原理:** 在 BFS 初始化时，我们将距离设为一个非常大的值（例如几亿）。任何可达的距离都远小于网格的总大小 (16)。因此，如果 dist[i] > 16，则它必然是那个**初始的极大值**，代表不可达。
+
+> **示例:** 假设一个 Block 负责检查索引 0 到 3 的元素：
+
+| 索引 i | 初始 dist[i] (GPU) | 检查 (dist[i] > 16) | dist[i] 的最终值 | 含义 |
+| :--- | :--- | :--- | :--- | :--- |
+| **0** | 3 (距离起点 3 步) | False (3 不大于 16) | **3** | 可达 |
+| **1** | 12789 (极大值) | True | **-1** | 不可达 |
+| **2** | 5 (距离起点 5 步) | False | **5** | 可达 |
+| **3** | 12789 (极大值) | True | **-1** | 不可达 |
+
+**总结：** 这个 Kernel 的效率极高，它利用并行性让所有线程同时执行一个简单的逻辑判断，将所有表示“无穷”的距离值替换为统一的 **-1** 标记，方便主机端读取和解释结果。
 
 
 //--------------------------------------------------------------------------------------------------
@@ -90,7 +730,65 @@ question7:
 
 不理解，请解释，用例子
 
+不理解，请解释，用例子
 
+    cudaMemcpy(result, dist + end_row * cols + end_col, sizeof(int), cudaMemcpyDeviceToDevice);
+
+answer:
+这段代码是 CUDA 主机端（CPU）代码，用于从 GPU 内存中，将最终计算出的 **终点最短距离** 复制到输出指针 result 所指向的位置。
+
+-----
+
+## ⚙️ I. 核心目的：提取终点距离
+
+整个并行 BFS 算法在 `dist` 数组中计算出了从起点到网格中每个点的最短距离。这段代码是**提取**终点 (end_row, end_col) 距离的最后一步。
+
+### 1. 变量含义
+
+  * **result (目标):** 主机端传入的指针，用于存储最终的答案（一个整数）。
+  * **dist (源):** GPU 上存储所有最短距离的数组。
+  * **end_row, end_col:** 目标终点的坐标。
+  * **cols:** 网格的列数 (Leading Dimension)。
+
+## 🔢 II. 索引计算
+
+在执行内存拷贝之前，需要计算终点 end_row, end_col) 在一维数组 dist 中的精确索引。
+
+终点索引 = end_row * cols + end_col
+
+### 示例解释
+
+假设网格是 10 * 10，我们想找到终点 end_row=8, end_col=3) 的最短距离。
+
+  * cols = 10。
+  * dist 数组的起始地址是 0。
+
+<!-- end list -->
+
+1.  **行偏移:** end_row * cols = 8 * 10 = 80。
+      * 这跳过了前 8 行的数据。
+2.  **列偏移:** + end_col = + 3。
+3.  **终点索引:** 80 + 3 = 83。
+
+**源指针 (`dist + index`):**
+dist + end_row * cols + end_col = dist + 83
+
+  * **含义:** `dist + 83` 是 GPU 上 dist 数组中，第 83 个元素（即终点距离）的内存地址。
+
+## 3. 内存拷贝
+
+c
+cudaMemcpy(result, dist + end_row * cols + end_col, sizeof(int), cudaMemcpyDeviceToDevice);
+
+
+  * **目标指针:** result（一个 GPU 内存地址）。
+  * **源地址:** dist + 83（GPU 内存）。
+  * **大小:** sizeof(int)（只拷贝一个整数）。
+  * **方向:** cudaMemcpyDeviceToDevice (GPU 到 GPU)。
+
+> **注意：** `result` 和 `dist` 都是 GPU 内存指针。如果 `result` 是函数签名中传入的 GPU 指针，那么方向就是 DeviceToDevice。
+
+**总结：** 这行代码将计算出的最短距离值（存储在 dist 数组的第 83 个位置）复制到 result 指针所指向的 GPU 内存地址，完成最终输出。
 
 
 //--------------------------------------------------------------------------------------------------
