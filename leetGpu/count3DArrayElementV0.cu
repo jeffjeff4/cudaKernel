@@ -1,3 +1,201 @@
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+//method0
+///*
+__global__
+void findCount(const int* input, int* output, int total_elements, int num_elements_per_thread, int P) {
+    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+    // int threads_per_block = blockDim.x;
+    const int threads_per_block = 256;
+    const int threads_per_warp = 32;
+
+    // 16 * 32
+    // 
+
+    // 0 1 ... 31
+    // 
+    // 
+    // ...
+    // 
+    int start_idx = (thread_id / threads_per_warp) * (num_elements_per_thread * threads_per_warp) + (threadIdx.x % threads_per_warp);
+    int end_idx = start_idx + num_elements_per_thread * threads_per_warp;
+
+    int count = 0;
+    for (int idx = start_idx; idx < end_idx; idx += threads_per_warp) {
+        if (idx < total_elements) {
+            count += (input[idx] == P);
+        }
+    }
+
+    int mask = -1; // 0xFFFFFFFF  
+    for (int delta = threads_per_warp/2; delta > 0; delta /= 2) {
+        count += __shfl_down_sync(mask, count, delta);
+    }
+    const int local_size = threads_per_block / threads_per_warp;
+    __shared__ int local[local_size];
+     int local_idx = (thread_id/threads_per_warp) % local_size;
+    if (thread_id % threads_per_warp == 0) {
+        local[local_idx] = count;
+    }
+    __syncthreads();
+
+    if (local_idx == 0) {        
+        for (int i = 1; i < local_size; i++) {
+            local[0] += local[i];
+        }
+        //for (int delta = 1; delta < local_size; delta = delta * 2) {
+        //    if (local_idx + delta < local_size)
+        //        local[local_idx] += local[local_idx + delta];
+        //}
+    }
+    __syncthreads();
+
+    if (local_idx == 0 && thread_id % threads_per_warp == 0) {
+        atomicAdd(output, local[0]);
+    }
+    // combine within a block
+
+    //  __syncthreads();
+    //  if (thread_id < total_elements)
+    //     atomicAdd(output, count);
+
+    // combine across all blocks
+}
+
+
+
+
+extern "C" void solve(const int* input, int* output, int N, int M, int K, int P) {
+    int num_elements = N * M * K;
+    int threadsPerBlock = 256;
+    int num_elements_per_thread = 16;
+    int numBlocks = (num_elements + (threadsPerBlock * num_elements_per_thread) - 1) / (threadsPerBlock * num_elements_per_thread);
+    findCount<<<numBlocks, threadsPerBlock>>>(input, output, num_elements, num_elements_per_thread, P);
+}
+//*/
+
+
+//method1
+//correct
+/*
+__global__
+void findCount(const int* input, int* output, int total_elements, int num_elements_per_thread, int P) {
+    // 线程块参数
+    const int threads_per_block = 256; 
+    const int threads_per_warp = 32;
+    __shared__ int local_sum[threads_per_block]; // 共享内存用于归约
+
+    // 1. 数据分工：计算线程负责的连续数据块
+    // -------------------------------------------------------------------
+    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+
+    // 计算当前线程负责的起始全局索引 (不再有复杂的 Warp 偏移)
+    int start_idx = thread_id * num_elements_per_thread;
+    int end_idx = start_idx + num_elements_per_thread;
+
+    // 2. 局部计数 (Local Accumulation)
+    // -------------------------------------------------------------------
+    int count = 0;
+    // 循环 num_elements_per_thread 次，处理线程的专属数据块
+    for (int idx = start_idx; idx < end_idx; idx++) {
+        if (idx < total_elements) {
+            count += (input[idx] == P);
+        }
+    }
+
+    // 3. Block 归约 (Reduction)
+    // -------------------------------------------------------------------
+    local_sum[threadIdx.x] = count; // 将局部计数存入共享内存
+    __syncthreads();
+
+    // 树形归约 (Block Reduction)
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (threadIdx.x < stride) {
+            local_sum[threadIdx.x] += local_sum[threadIdx.x + stride];
+        }
+    }
+
+    // 4. 最终写入 (Atomic Add)
+    // -------------------------------------------------------------------
+    if (threadIdx.x == 0) {
+        // 线程 0 将 Block 的总和写入全局 output
+        atomicAdd(output, local_sum[0]);
+    }
+}
+
+extern "C" void solve(const int* input, int* output, int N, int M, int K, int P) {
+    int num_elements = N * M * K;
+    int threadsPerBlock = 256;
+    int num_elements_per_thread = 16;
+    int numBlocks = (num_elements + (threadsPerBlock * num_elements_per_thread) - 1) / (threadsPerBlock * num_elements_per_thread);
+    findCount<<<numBlocks, threadsPerBlock>>>(input, output, num_elements, num_elements_per_thread, P);
+}
+*/
+
+
+//method2
+//wrong
+/*
+__global__
+void findCount(const int* input, int* output, int total_elements, int num_elements_per_thread, int P) {
+    int thread_id = blockDim.x * blockIdx.x + threadIdx.x;
+    // int threads_per_block = blockDim.x;
+    const int threads_per_block = 256;
+    const int threads_per_warp = 32;
+
+    int start_idx = thread_id * num_elements_per_thread + (threadIdx.x % threads_per_warp);
+    int end_idx = start_idx + num_elements_per_thread * threads_per_warp;
+
+    // 假设 threads_per_block = 256, num_elements_per_thread = 16
+
+    // 1. 数据处理 (局部计数)
+    int count = 0;
+    // **** 核心改变：循环不再是交错步长 32，而是简单的 1 步长，覆盖自己的区域 ****
+    // **注意：这里假设 start_idx 是有效的，且线程只需迭代 num_elements_per_thread 次**
+    for (int idx = start_idx; idx < (thread_id * num_elements_per_thread + num_elements_per_thread); idx++) {
+    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    // 必须重新定义循环的终止条件，否则 end_idx 的计算会使循环执行 32 * num_elements_per_thread 次
+    // 假设每个线程只需要处理 NUP_ELEMENTS_PER_THREAD 个元素
+        if (idx < total_elements) {
+            count += (input[idx] == P);
+        }
+    }
+
+
+    // 2. 归约 (简化为 Block-Stride Reduction，不使用 Warp 级分工)
+    // 放弃 Warp Leader 写入共享内存的复杂逻辑，转而使用简单的 Block 归约。
+
+    __shared__ int local_sum[threads_per_block];
+    local_sum[threadIdx.x] = count;
+    __syncthreads();
+
+    // 树形归约 (Block Reduction)
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        if (threadIdx.x < stride) {
+            local_sum[threadIdx.x] += local_sum[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    // 3. 最终写入 (Block Leader)
+    if (threadIdx.x == 0) {
+        // 线程 0 将 Block 的总和写入全局 output
+        atomicAdd(output, local_sum[0]);
+    }
+
+}
+
+
+extern "C" void solve(const int* input, int* output, int N, int M, int K, int P) {
+    int num_elements = N * M * K;
+    int threadsPerBlock = 256;
+    int num_elements_per_thread = 16;
+    int numBlocks = (num_elements + (threadsPerBlock * num_elements_per_thread) - 1) / (threadsPerBlock * num_elements_per_thread);
+    findCount<<<numBlocks, threadsPerBlock>>>(input, output, num_elements, num_elements_per_thread, P);
+}
+*/
 
 
 
