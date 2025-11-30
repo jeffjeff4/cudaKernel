@@ -1,5 +1,88 @@
 
+#include <cuda_runtime.h>
 
+#define THREAD_NUM_X		16
+#define THREAD_NUM_Y		16
+#define THREAD_NUM_Z		4
+#define WARP_SIZE           32
+#define STRIDE_LENGTH       8
+#define DIV_UP(n, x)       ((n+(x)-1)/(x))  // x一定要加上括号!
+
+__device__ __forceinline__ int warp_sum(int val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// 分别为深度/行数/列数
+__global__ void subarray_sum_3d_equal_kernel(const int* __restrict__ input, int* output, int ndeps, int nrows, int ncols,
+int N, int M, int K, int S_DEP, int E_DEP, int S_ROW, int E_ROW, int S_COL, int E_COL) {
+    /* 0.每个线程每个方向上读取 STRIDE_LENGTH个元素并求和,每个元素在 input中间隔 WARP_SIZE
+       以保证每个块读取连续 WARP_SIZE，合并内存访问 */
+    int tcol = blockIdx.x * blockDim.x * STRIDE_LENGTH + threadIdx.x;
+    int trow = blockIdx.y * blockDim.y * STRIDE_LENGTH + threadIdx.y;
+    int tdep = blockIdx.z * blockDim.z * STRIDE_LENGTH + threadIdx.z;
+
+    int sum_val = 0;
+    // 三维矩阵是行主序存储的,按照 Z/Y/X方式是可以连续读取的 
+    for (int i=0; i<STRIDE_LENGTH; ++i) {
+        // 比如,0号线程读取的就是 Z方向上块 0、块 1、...块STRIDE_LENGTH-1的 0号位置元素
+        int dep = tdep + i*blockDim.z;
+        for (int j=0; j<STRIDE_LENGTH; ++j) {
+            int row = trow + j*blockDim.y;
+            for (int k=0; k<STRIDE_LENGTH; ++k) {
+                int col = tcol + k*blockDim.x;
+                if (dep < ndeps && row < nrows && col < ncols) {
+                    int pos = (dep+S_DEP)*M*K+(row+S_ROW)*K+(col+S_COL);
+                    sum_val += input[pos];
+                }
+            }
+        }
+    }
+
+    // 1.每个 warp就是 32个线程,一个块 1024个线程时就是 32个 warp,与维度无关
+    // 在每个 warp内规约求和，并将其部分求和结果存储到共享内存中
+    __shared__ int shared_partial_sum[WARP_SIZE];
+        // 三维块内线性索引（行主序，x变化最快，然后y，最后z）
+    int tid = threadIdx.z * (blockDim.x * blockDim.y) +  threadIdx.y * blockDim.x +  threadIdx.x;
+    int warp = tid >> 5;    // 当前线程所在的 warp在整个 warp数组中的下标
+    int lane = tid & 31;    // 当前线程在当前 warp内的下标
+
+    int wsum = warp_sum(sum_val);
+    if (lane == 0) {
+        shared_partial_sum[warp] = wsum;
+    }
+    __syncthreads();
+
+    // 2.将每个块内所有 warp已得到的部分求和结果再进行规约求和
+    if (warp == 0) {
+        int partial_sum_val = shared_partial_sum[lane];
+        shared_partial_sum[0] = warp_sum(partial_sum_val);
+    }
+
+    // 3.利用原子加操作,对所有块内的 shared_partial_sum[0]求和
+    if (tid == 0) {
+        atomicAdd(output, shared_partial_sum[0]);
+    }
+}
+
+// input, output are device pointers (i.e. pointers to memory on the GPU)
+// N/M/K分别为深度/行数/列数
+extern "C" void solve(const int* input, int* output, int N, int M, int K, int S_DEP, int E_DEP, int S_ROW, int E_ROW, int S_COL, int E_COL) {
+    // 共计 1024个线程
+    dim3 threadsPerBlock(THREAD_NUM_X, THREAD_NUM_Y, THREAD_NUM_Z);
+	int ncols = E_COL - S_COL + 1;
+	int nrows = E_ROW - S_ROW + 1;
+	int ndeps = E_DEP - S_DEP + 1;
+    dim3 blocksPerGrid(DIV_UP(ncols, THREAD_NUM_X*STRIDE_LENGTH), DIV_UP(nrows, THREAD_NUM_Y*STRIDE_LENGTH), DIV_UP(ndeps, THREAD_NUM_Z*STRIDE_LENGTH));
+
+    // 确保output初始化为0
+    cudaMemset(output, 0, sizeof(int));
+
+    subarray_sum_3d_equal_kernel<<<blocksPerGrid, threadsPerBlock>>>(input, output, ndeps, nrows, ncols, N, M, K, S_DEP, E_DEP, S_ROW, E_ROW, S_COL, E_COL);
+    cudaDeviceSynchronize();
+}
 
 
 
