@@ -1,4 +1,84 @@
 
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <stdio.h>
+
+#define CEIL_DIV(A, B) ((A + B - 1) / B)
+
+template <int T, int Mr, int Mc>
+__global__ void batched_mm(const half* A, const half* B, half* C, int BATCH, int M, int N, int K) {
+    int tid = threadIdx.x;
+    int tilesPerRow = T/Mc;
+    int tc = tid % tilesPerRow;
+    int tr = tid / tilesPerRow;
+    int col0 = T * blockIdx.x + tc * Mc;
+    int row0 = T * blockIdx.y + tr * Mr;
+    int b = blockIdx.z;
+    int idx = (b * M * N) + row0 * N + col0;
+    
+    // basic shared memory
+    __shared__ float A_s[T][T];
+    __shared__ float B_s[T][T];
+    float acc[Mr][Mc];
+    // move tile by tile through K-axis
+    int numTiles = CEIL_DIV(K, T);
+
+    for (int r = 0; r < Mr; r++) {
+        for (int c = 0; c < Mc; c++) {
+            acc[r][c] = 0.0f;
+        }
+    }
+
+    for (int t = 0; t < numTiles; t++) {
+        // laod tiles into shared memory
+        for (int r = 0; r < Mr; r++) {
+            for (int c = 0; c < Mc; c++) {
+                int tRow = tr*Mr + r;
+                int tCol = tc*Mc + c;
+                int Acol = t*T + tc*Mc;
+                int Brow = t*T + tr*Mr;
+                A_s[tRow][tCol] = (row0 + r < M && Acol + c < K) ? static_cast<float>(A[(b * M * K) + (row0 + r) * K + Acol + c]): 0.0f;
+                B_s[tRow][tCol] = (Brow + r < K && col0 + c < N) ? static_cast<float>(B[(b * N * K) + (Brow + r) * N + col0 + c]): 0.0f;
+            }
+        }
+        
+        __syncthreads();
+        // dot product on tiles
+        for (int k = 0; k < T; k++) {
+            for (int r = 0; r < Mr; r++) {
+                float A = A_s[tr*Mr + r][k];
+                #pragma unroll
+                for (int c = 0; c < Mc; c++) {
+                    acc[r][c] += A * B_s[k][tc*Mc + c];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    
+    // update output
+    for (int r = 0; r < Mr; r++) {
+        for (int c = 0; c < Mc; c++) {
+            if (row0 + r < M && col0 + c < N) {
+                C[(b * M * N) + (row0 + r)* N + col0 + c] = __float2half(acc[r][c]);
+            }
+        }
+        
+    }
+
+}
+
+
+// A, B, C are device pointers
+extern "C" void solve(const half* A, const half* B, half* C, int BATCH, int M, int N, int K) {
+    int T = 64;
+    int Mr = 8;
+    int Mc = 4;
+    int threadsPerBlock = (T/Mr)*(T/Mc);
+    dim3 numBlocks(CEIL_DIV(N, T), CEIL_DIV(M, T), BATCH);
+    batched_mm<64, 8, 4><<<numBlocks, threadsPerBlock>>>(A, B, C, BATCH, M, N, K);
+
+}
 
 
 
@@ -8,6 +88,125 @@
 question0:
 不理解，请解释，用例子
 
+这段代码实现了一个高度优化的 **半精度批量矩阵乘法（Batched Half-Precision Matrix Multiplication）** Kernel，用于计算 C = A * B。
+
+它采用 **Shared Memory Tiling（共享内存分块）** 和 **Thread-Level Accumulation（线程级累加）** 策略来最大化 GPU 的性能。
+
+-----
+
+## ⚙️ I. 核心目标和分块几何
+
+该 Kernel 的主要目标是计算 C_{M * N = A_{M * K * B_{K * N，并对 BATCH 维度进行并行处理。
+
+### 1\. 分块层级（Tiling Hierarchy）
+
+代码使用三层分块来组织工作：
+
+| 变量 | 示例值 | 含义 |
+| :--- | :--- | :--- |
+| **B** | `blockIdx.z` | **Batch 级别**：最高的并行性，每个 Block 独立处理一个 Batch。 |
+| **T** | 64 | **Block Tile 级别**：每个线程块负责 M * N 输出矩阵的一个大 T * T 区域。 |
+| **Mr, Mc** | 8, 4 | **Thread Tile 级别**：每个线程累加的最小子块尺寸 (Mr * Mc)。 |
+
+### 2\. 线程块内部的划分
+
+线程块内部（`tid` 范围是 0 到 128）：
+
+  * **`tilesPerRow`** = T / Mc = 64 / 4 = 16
+  * **`tc` (Tile Column Index):** 0 到 15。线程在 T * T Tile 内部的列坐标。
+  * **`tr` (Tile Row Index):** 0 到 7。线程在 T * T Tile 内部的行坐标。
+
+这 128 个线程被组织成 8 * 16 的逻辑网格，每个线程负责计算 C 矩阵的一个 8 * 4 小块。
+
+-----
+
+## 🚀 II. Kernel 内部流程
+
+### 1\. 初始化和寄存器累加器
+
+c
+// ...
+__shared__ float A_s[T][T]; // T x T Shared Tile for A
+__shared__ float B_s[T][T]; // T x T Shared Tile for B
+float acc[Mr][Mc];          // Thread-private register accumulator (8x4)
+
+
+  * **Shared Memory (float):** 虽然输入是半精度 (`half`)，但 Shared Memory 使用 `float` 存储，以保证计算的**精度和数值稳定性**（这是高性能 GEMM 优区的常见做法）。
+  * **寄存器 (acc):** 每个线程在寄存器中初始化一个 8 * 4 的累加器，用于保存最终的 C 结果。
+
+### 2\. K 维度主循环 (Tiling Loop)
+
+c
+int numTiles = CEIL_DIV(K, T); // K 维度的分块次数
+for (int t = 0; t < numTiles; t++) {  
+
+
+  * **目的:** 将 C = A * B 的点积 (\sum_k) 分解为 numTiles 次 T 维度的点积累加。
+
+### 3\. 加载 Tile (Global \rightarrow Shared)
+
+这是流水线的第一步：线程块协作将当前 K Tile 的数据加载到 Shared Memory。
+
+c
+for (int r = 0; r < Mr; r++) { // 遍历线程的 8 行
+    for (int c = 0; c < Mc; c++) { // 遍历线程的 4 列
+        // ...
+        A_s[tRow][tCol] = (row0 + r < M && Acol + c < K) ? static_cast<float>(A[...]): 0.0f;
+        B_s[tRow][tCol] = (Brow + r < K && col0 + c < N) ? static_cast<float>(B[...]): 0.0f;
+    
+
+__syncthreads();
+
+
+  * **分工:** 128 个线程协作加载 A 和 B 的 T * T (64x64) Shared Tile。
+  * **边界检查与填充:** 检查 A 和 B 的索引是否在 M, N, K 的有效范围内，否则用 0.0f **填充** Shared Memory。
+  * **精度转换:** static_cast<float>(\dots) 在加载时将 `half` 类型的数据转换为 `float`。
+
+### 4\. 核心计算 (MMA)
+
+c
+for (int k = 0; k < T; k++) { // K 维度 (内积循环)
+    for (int r = 0; r < Mr; r++) { // 线程的 8 行
+        float A = A_s[tr*Mr + r][k]; // 从 Shared Memory 读取 A 元素 (转置/行访问)
+        #pragma unroll
+        for (int c = 0; c < Mc; c++) { // 线程的 4 列
+            acc[r][c] += A * B_s[k][tc*Mc + c];
+        
+    
+
+__syncthreads();
+
+
+  * **目的:** 在寄存器中计算 8 * 4 结果块的点积。
+  * **A 矩阵访问:** `A_s[tr*Mr + r][k]` 访问 A 的 i 行和 k 列。
+  * **B 矩阵访问:** `B_s[k][tc*Mc + c]` 访问 B 的 k 行和 j 列。
+  * **累加:** 结果累加到 acc[r][c]。
+  * **`#pragma unroll`:** 强制展开 c 循环，提高 FMA (乘加) 指令的吞吐量。
+
+-----
+
+## 🏁 III. 最终结果写回
+
+c
+for (int r = 0; r < Mr; r++) {
+    for (int c = 0; c < Mc; c++) {
+        if (row0 + r < M && col0 + c < N) {
+            C[(b * M * N) + (row0 + r)* N + col0 + c] = __float2half(acc[r][c]);
+        
+    
+
+
+
+  * **边界检查:** 确保只写入 M * N 矩阵的有效区域。
+  * **精度转换:** __float2half(\dots) 将最终的 `float` 结果转换回 half 类型。
+  * **写回:** 将 8 * 4 的结果块写回到全局 C 矩阵的正确位置。
+
+## 💻 IV. 主机端 (`solve`)
+
+  * **Grid Size:** `dim3 numBlocks(...)` 计算 Grid 尺寸。Grid 的 Z 维度被设置为 BATCH，确保每个批次矩阵乘法都由独立的线程块网格并行处理。
+  * **Kernel 启动:** 启动 Kernel 完成计算。
+
+[Image of Matrix Multiply Tiling diagram]
 
 
 //--------------------------------------------------------------------------------------------------
@@ -19,6 +218,107 @@ question1:
 
 不理解，请解释，用例子
 
+不理解，请解释，有例子
+
+    int tid = threadIdx.x;
+    int tilesPerRow = T/Mc;
+    int tc = tid % tilesPerRow;
+    int tr = tid / tilesPerRow;
+    int col0 = T * blockIdx.x + tc * Mc;
+    int row0 = T * blockIdx.y + tr * Mr;
+    int b = blockIdx.z;
+    int idx = (b * M * N) + row0 * N + col0;
+
+answer:
+
+
+这段代码是 **批量矩阵乘法 (Batched Matrix Multiplication)** Kernel 的关键初始化部分，用于计算**当前线程在整个全局输出矩阵 C 上的起始坐标和索引**。
+
+它将线程块内的 **一维线程 ID (tid)** 巧妙地映射到一个 **二维坐标 (tr, tc)** 上，从而实现高效的线程分工。
+
+-----
+
+## ⚙️ I. 核心目标：线程 ID \rightarrow 全局索引
+
+目标是将线程块内 128 个线程中的每一个线程，分配到 M * N 输出矩阵上的一个独特的 Mr * Mc (例如 8 * 4) 小块。
+
+### 示例参数设定
+
+我们使用代码中的典型值：
+
+| 参数 | 值 | 含义 |
+| :--- | :--- | :--- |
+| T | 64 | Block Tile 尺寸 (例如 64 * 64) |
+| Mr | 8 | 线程负责的行数 |
+| Mc | 4 | 线程负责的列数 |
+| **线程块** | 32 * 16 = 512 线程 (代码中 tid 范围是 0 到 127，这里简化为 8 * 16 = 128 线程) |
+| **矩阵尺寸** | M=512, N=512 | |
+
+-----
+
+## 🚀 II. 线程块内的 2D 划分 (将 tid 线性化)
+
+c
+int tid = threadIdx.x;
+int tilesPerRow = T/Mc; // 64 / 4 = 16
+int tc = tid % tilesPerRow;
+int tr = tid / tilesPerRow;
+
+
+  * **tilesPerRow (16):** 表示一个 T * T (64x64) 的 Tile 在宽度上可以容纳 **16 个** 线程负责的 8 * 4 小块。
+  * **tc (Tile Column Index):** 使用取模 (`% 16`) 运算，将 tid 限制在 0 到 15 之间。这代表线程在 Block Tile 内的**列坐标**。
+  * **tr (Tile Row Index):** 使用整数除法 (`/ 16`)，将 tid 划分成 128 / 16 = 8 组。这代表线程在 Block Tile 内的**行坐标**。
+
+### 示例分析 (tid \rightarrow tr, tc)
+
+| tid | tr (行, / 16) | tc (列, % 16) | 含义 |
+| :--- | :--- | :--- | :--- |
+| **0** | 0 / 16 = 0 | 0 % 16 = 0 | 负责 (0, 0) 小块 |
+| **15** | 15 / 16 = 0 | 15 % 16 = 15 | 负责 (0, 15) 小块 (Tile 的最右边) |
+| **16** | 16 / 16 = 1 | 16 % 16 = 0 | 负责 (1, 0) 小块 (下一行最左边) |
+| **127** | 127 / 16 = 7 | 127 % 16 = 15 | 负责 (7, 15) 小块 (Tile 的最右下角) |
+
+## 🧭 III. 计算全局坐标 (row0 和 col0)
+
+c
+int col0 = T * blockIdx.x + tc * Mc;
+int row0 = T * blockIdx.y + tr * Mr;
+
+
+  * **目的:** row0 和 col0 计算的是该线程的 Mr * Mc 区域在**整个 M * N 矩阵**上的**起始坐标**。
+
+### 示例分析 (row0, col0)
+
+假设 blockIdx.x=1, blockIdx.y=2。线程 tid=16 (tr=1, tc=0)。
+
+1.  **Block 偏移 (Tile Jump):**
+
+      * Block 在 M 维度的起始行: T * blockIdx.y = 64 * 2 = 128。
+      * Block 在 N 维度的起始列: T * blockIdx.x = 64 * 1 = 64。
+
+2.  **线程偏移 (Thread Jump):**
+
+      * 线程在 Block 内的行偏移: tr * Mr = 1 * 8 = 8。
+      * 线程在 Block 内的列偏移: tc * Mc = 0 * 4 = 0。
+
+3.  **最终 row0 和 col0:**
+
+      * row0 = 128 + 8 = 136。
+      * col0 = 64 + 0 = 64。
+
+> **结论:** 线程 tid=16 负责计算输出矩阵 C 上从 **(行 136, 列 64)** 开始的 8 * 4 结果块。
+
+## 3\. 计算最终全局索引 (idx)
+
+c
+int b = blockIdx.z;
+int idx = (b * M * N) + row0 * N + col0;
+
+
+  * **Batch 偏移 (b):** b * M * N 跳过了前面所有 Batch 的数据，定位到当前 Batch 的起始位置。
+  * **最终索引 (idx):** 基于 Row-Major 存储格式，计算出线程 tid 负责的 C 矩阵区域的**第一个元素**在整个扁平数组中的全局索引。
+
+**总结:** 这段代码是 **分层索引** 的典范，它将 tid 逐步转换为 tr/tc 坐标，再结合 blockIdx 最终确定 idx，实现了对 GPU 上每一个线程的精准工作分配。
 
 //--------------------------------------------------------------------------------------------------
 
@@ -29,6 +329,84 @@ question2:
 
 不理解，请解释，用例子
 
+    // basic shared memory
+    __shared__ float A_s[T][T];
+    __shared__ float B_s[T][T];
+    float acc[Mr][Mc];
+    // move tile by tile through K-axis
+    int numTiles = CEIL_DIV(K, T);
+
+    for (int r = 0; r < Mr; r++) {
+        for (int c = 0; c < Mc; c++) {
+            acc[r][c] = 0.0f;
+        
+    
+
+answer:
+
+这段代码是 **半精度批量矩阵乘法 (Batched Half-Precision Matrix Multiplication)** Kernel 的初始化部分，它定义了**数据存储的位置**和**计算前的准备工作**。
+
+它展示了优化 SGEMM (矩阵乘法) 中典型的 **三级内存层次结构**：共享内存、寄存器和 Block-Stride 循环。
+
+-----
+
+## ⚙️ I. 核心目标：初始化三级内存
+
+这段代码的目标是为当前的线程块 (Block) 准备好计算资源，即定义存储输入数据和最终结果的缓冲区。
+
+### 1\. 共享内存 Tile (Shared Memory)
+
+c
+__shared__ float A_s[T][T];
+__shared__ float B_s[T][T];
+
+
+  * **位置:** **共享内存 (Shared Memory)**。这是 Block 内所有线程共享的快速片上缓存。
+  * **作用:** 存储 A 矩阵和 B 矩阵的当前 T * T 分块（Tile）。在计算 C = A * B 时，所有线程将协作加载数据到这里，并反复重用。
+  * **尺寸:** T * T (例如 64 * 64)。
+  * **数据类型:** 虽然输入是 `half` (半精度)，但这里使用 `float` 存储，以保证后续计算的**数值精度**。
+
+### 2\. 累加器 (Register)
+
+c
+float acc[Mr][Mc];
+
+
+  * **位置:** **寄存器 (Registers)**。这是线程私有的最快存储空间。
+  * **作用:** 存储当前线程计算的 C 矩阵的最终 Mr * Mc (例如 8 * 4) 结果子块。这个数组将用于累积所有的乘加操作 (MMA)。
+  * **尺寸:** Mr * Mc。
+
+-----
+
+## 🚀 II. 计算和初始化工作
+
+### 1\. K 维度分块次数
+
+c
+// move tile by tile through K-axis
+int numTiles = CEIL_DIV(K, T);
+
+
+  * **目的:** 确定矩阵乘法沿着 K 维度（内积维度）需要执行多少次分块乘法和累加。
+  * **K:** 矩阵 A 的列数 / 矩阵 B 的行数。
+  * **T:** Block Tile 尺寸 (64)。
+  * **示例:** 假设 K=1000。 numTiles = CEIL_DIV(1000, 64) = 16。
+  * **含义:** Kernel 将执行 16 次大循环，每次处理 K 维度上的 64 个元素。
+
+### 2\. 初始化累加器
+
+c
+for (int r = 0; r < Mr; r++) {
+    for (int c = 0; c < Mc; c++) {
+        acc[r][c] = 0.0f;
+    
+
+
+
+  * **目的:** 将寄存器中的 C 结果累加器 acc 初始化为 0.0f。
+  * **原因:** 矩阵乘法是乘积之和，必须从零开始累加。
+
+> **总结：** 这段代码是为 Kernel 的核心计算做准备。它明确了数据的三级流向：从 A, B (Global) \rightarrow A_s, B_s (Shared) \rightarrow acc (Register)，并定义了控制主循环的 numTiles。
 
 
 //--------------------------------------------------------------------------------------------------
@@ -41,6 +419,129 @@ question3:
 
 不理解，请解释，用例子
 
+不理解，请解释，有例子
+
+        // laod tiles into shared memory
+        for (int r = 0; r < Mr; r++) {
+            for (int c = 0; c < Mc; c++) {
+                int tRow = tr*Mr + r;
+                int tCol = tc*Mc + c;
+                int Acol = t*T + tc*Mc;
+                int Brow = t*T + tr*Mr;
+                A_s[tRow][tCol] = (row0 + r < M && Acol + c < K) ? static_cast<float>(A[(b * M * K) + (row0 + r) * K + Acol + c]): 0.0f;
+                B_s[tRow][tCol] = (Brow + r < K && col0 + c < N) ? static_cast<float>(B[(b * N * K) + (Brow + r) * N + col0 + c]): 0.0f;
+            
+        
+
+answer:
+这段代码是 **半精度矩阵乘法优化 Kernel** 中，用于将 A 和 B 矩阵的当前分块（Tile）从慢速的\*\*全局内存（Global Memory）**加载到快速的**共享内存（Shared Memory）\*\*的关键步骤。
+
+这个过程是 **协作式加载（Cooperative Loading）**，线程块中的所有线程分摊加载任务。
+
+-----
+
+## ⚙️ I. 核心目标：线程与共享内存的映射
+
+这段代码的目标是：
+
+1.  计算当前线程在 A_s 和 B_s 共享内存 Tile 中的写入位置 (tRow, tCol)。
+2.  计算需要从全局 A, B 矩阵中读取的**全局索引**。
+3.  处理**边界检查**和**零填充** (Zero Padding)。
+
+### 示例参数设定
+
+我们使用 Kernel 中的典型值：
+
+| 变量 | 值 | 含义 |
+| :--- | :--- | :--- |
+| T | 64 | Block Tile 尺寸 |
+| Mr | 8 | 线程 M 维度行数 |
+| Mc | 4 | 线程 N 维度列数 |
+| tr | 1 | 线程 Block 内的行坐标 |
+| tc | 1 | 线程 Block 内的列坐标 |
+| t | 0 | 当前 K 维度分块索引 |
+| row0 | 64 | Block 的全局起始行 |
+| col0 | 64 | Block 的全局起始列 |
+| **矩阵尺寸** | M=512, N=512, K=512 | |
+
+-----
+
+## 🚀 II. 坐标计算与共享内存写入
+
+### 1\. 共享内存 (Shared Memory) 坐标
+
+c
+int tRow = tr*Mr + r; // 1*8 + r
+int tCol = tc*Mc + c; // 1*4 + c
+
+
+  * **目的:** 计算当前线程在 A_s (64 * 64) 和 B_s (64 * 64) 数组中的**写入坐标**。
+  * **示例:** 线程 tr=1, tc=1 负责写入 A_s 的 [8, 4] 区域。
+      * r (0到7) 和 c (0到3) 遍历线程的 8 * 4 小块。
+      * tRow 范围是 8 到 15。tCol 范围是 4 到 7。
+
+### 2\. K 维度全局偏移
+
+c
+int Acol = t*T + tc*Mc; // 0*64 + 1*4 = 4
+int Brow = t*T + tr*Mr; // 0*64 + 1*8 = 8
+
+
+  * **Acol:** A 矩阵 Tile 在 K 维度上的**起始列**。
+  * **Brow:** B 矩阵 Tile 在 K 维度上的**起始行**。
+  * **用途:** 这些偏移量将用于定位 Global Memory 中的 A 和 B 数据。
+
+-----
+
+## 3\. 全局内存读取 (Global Load)
+
+### A. 加载 A 矩阵数据
+
+c
+// ... ? static_cast<float>(A[(b * M * K) + (row0 + r) * K + Acol + c]): 0.0f;
+
+
+  * **目标:** 线程读取 A 矩阵的 M * K 区域中的一个元素 A_{i, k。
+  * **索引分解:**
+      * (b * M * K): Batch 偏移。
+      * (row0 + r) * K: 确定全局行索引（行 row0 + r）的起始位置。
+      * + Acol + c: 确定全局列索引（列 Acol + c）的最终位置。
+
+> **示例:** r=0, c=0。
+> 线程读取 A 矩阵的全局坐标 (64, 4) 处的数据（即 A_{64, 4）。
+
+### B. 加载 B 矩阵数据
+
+c
+// ... ? static_cast<float>(B[(b * N * K) + (Brow + r) * N + col0 + c]): 0.0f;
+
+
+  * **目标:** 线程读取 B 矩阵的 K * N 区域中的一个元素 B_{k, j。
+  * **索引分解:**
+      * (b * N * K): Batch 偏移。
+      * (Brow + r) * N: 确定全局行索引（行 Brow + r）的起始位置。
+      * + col0 + c: 确定全局列索引（列 col0 + c）的最终位置。
+
+> **示例:** r=0, c=0。
+> 线程读取 B 矩阵的全局坐标 (8, 64) 处的数据（即 B_{8, 64）。
+
+### 4\. 边界检查和零填充
+
+c
+// A 矩阵检查: row0 + r < M && Acol + c < K
+// B 矩阵检查: Brow + r < K && col0 + c < N
+
+
+  * **目的:** 确保读取操作在矩阵的有效边界内。
+  * **零填充:** 如果超出边界（例如 Acol + c > K），则写入 0.0f 到共享内存 (A_s)，保证计算的正确性。
+
+## 🎯 总结
+
+这段双重循环让 128 个线程协作：
+
+1.  精确计算 A 和 B 矩阵在 Global Memory 中的地址。
+2.  将 A 和 B 的数据加载到 64 * 64 的 A_s 和 B_s 共享内存 Tile 中。
+3.  同时将输入数据从 `half` 转换为 `float`，并处理边界。
 
 
 
@@ -54,7 +555,104 @@ question4:
 
 不理解，请解释，用例子
 
+不理解，请解释，用例子
 
+        // dot product on tiles
+        for (int k = 0; k < T; k++) {
+            for (int r = 0; r < Mr; r++) {
+                float A = A_s[tr*Mr + r][k];
+                #pragma unroll
+                for (int c = 0; c < Mc; c++) {
+                    acc[r][c] += A * B_s[k][tc*Mc + c];
+                
+            
+        
+
+answer:
+这段代码是 **批量矩阵乘法 (Batched Matrix Multiplication)** Kernel 的核心计算部分，负责在 **寄存器** 和 **共享内存** 之间执行 **分块点积 (Tiled Dot Product)**。
+
+它的目标是计算当前 Block Tile 内所有 8 * 4 小块的结果，并累加到线程的私有寄存器 acc 中。
+
+-----
+
+## ⚙️ I. 核心目标：分块矩阵乘法 (C_{tile += A_{tile * B_{tile)
+
+在矩阵乘法 C = A * B 中，我们计算的是：
+C_(i, j) = sum_k A_(i, k) * B_(k, j)
+
+这个三层循环结构，正是用来实现这个点积累加的：
+
+  * **最外层 (k 循环):** 迭代 K 维度（内积维度）上的分块，执行 T 次乘法累加。
+  * **中间 (r 循环):** 迭代 C 矩阵的 M 维度（行），由线程负责的 Mr 行决定。
+  * **最内层 (c 循环):** 迭代 C 矩阵的 N 维度（列），由线程负责的 Mc 列决定。
+
+## 🔢 II. 示例参数设定
+
+| 参数 | 值 | 含义 |
+| :--- | :--- | :--- |
+| T | 64 | 共享 Tile 尺寸 |
+| Mr | 8 | 线程 M 维度行数 |
+| Mc | 4 | 线程 N 维度列数 |
+| tr | 1 | 线程 Block 内的行坐标 |
+| tc | 1 | 线程 Block 内的列坐标 |
+
+**线程责任:** 当前线程负责计算 C 矩阵上的一个 8 * 4 结果块。
+
+-----
+
+## 🚀 III. 循环分解与数据流
+
+### 1\. K 维度迭代 (k 循环)
+
+c
+for (int k = 0; k < T; k++) { // 循环 64 次
+    // ...
+}
+
+
+  * **目的:** k 遍历 A 和 B 共享 Tile 的 T 维度。每轮循环，**所有线程**都将 A 的一列和 B 的一行相乘，并累加到 C 的结果中。
+
+### 2\. A 矩阵数据广播
+
+c
+float A = A_s[tr*Mr + r][k];
+
+
+  * **目的:** 读取 A 矩阵 Tile 的一个元素 A_(i, k)。
+  * **读取地址:** A_s 上的行索引是 tr * Mr + r (线程的全局行偏移)，列索引是 k (内积索引)。
+  * **数据重用:** 在内层的 c 循环中，**这个 A 值是固定的**。一个 A 值（A_(i, k）将被重复用于 B 矩阵的 4 个元素 (B_(k, 0), B_(k, 1), B_(k, 2), B_(k, 3) 的乘法。
+
+> **示例:** r=0, k=0 时，线程读取 A_(s[8][0])。这个 A 值将被用于计算 C_(8, 0)、C_(8, 1)、C_(8, 2)、C_(8, 3)。
+
+### 3\. C 和 B 矩阵的乘加 (c 循环)
+
+c
+#pragma unroll
+for (int c = 0; c < Mc; c++) {
+    acc[r][c] += A * B_s[k][tc*Mc + c];
+
+
+
+  * **目的:** 这是核心的 Mr * Mc 乘加累积。
+  * **acc[r][c] (LHS):** 线程的寄存器累加器中，第 r 行、第 c 列的元素。
+  * **A:** 从 A 矩阵读取的固定值 A_{i, k。
+  * **B_s[\dots] (RHS):** 访问 B 矩阵的 k 行和 j 列。由于 B 是行主序存储的，`tc*Mc + c` 保证了线程在 Shared Memory 中**连续读取** B 的 4 个元素。
+
+> **示例:** 线程 tx 的 r=0 循环，k=0 时：
+>
+>   * c=0: acc[0][0] += A_(s[8][0]) * B_(s[0][4])
+>   * c=1: acc[0][1] += A_(s[8][0]) * B_(s[0][5])
+>   * ...
+>   * c=3: acc[0][3] += A_(s[8][0]) * B_(s[0][7])
+
+## 🎯 总结
+
+这段代码通过 **三重循环** 实现了矩阵乘法，其中：
+
+1.  数据 A_{s 和 B_{s 在高速 **Shared Memory** 中。
+2.  结果 acc 累积在最快的 **Registers** 中。
+3.  A 值在内循环中被**重复使用 4 次**，极大地提高了计算效率和数据局部性。
+4.  \#pragma\ unroll 确保了最内层和中间层循环被展开为快速的 **FMA (乘加)** 指令序列。
 
 //--------------------------------------------------------------------------------------------------
 
@@ -65,6 +663,48 @@ question5:
 
 不理解，请解释，用例子
 
+A矩阵是行主序还是列主序？
+
+您提供的 CUDA 代码中，对于输入矩阵 A 的存储顺序，虽然没有显式的说明，但从代码的**索引访问模式**来看，它遵循的是**行主序 (Row-Major)** 的存储约定。
+
+---
+
+## ⚙️ I. 索引模式分析
+
+我们来看 Kernel 中用于访问 A 矩阵的代码片段。
+
+### 1. Naive Kernel 访问 (经典 Row-Major)
+
+在未优化的 `sgemm_Kernel_Naive` 中，访问 A_{i, k 的索引是：
+
+A[row * K + k]
+
+* **row * K (行偏移):** 跳过 row 行，每行有 K 个元素。
+* **+ k (列偏移):** 移动到 k 列。
+
+**结论:** 这种 row * LD + col 的索引公式是 **行主序 (Row-Major)** 存储的典型标志。
+
+### 2. 优化 Kernel 中的地址计算
+
+在 `batched_mm` Kernel 的加载部分，访问 A 的全局索引是：
+
+A[\dots + (row0 + r) * K + (Acol + c)]
+
+* **(row0 + r) * K (行偏移):** 使用 K（矩阵 A 的列数）作为 **Leading Dimension (LD)**。
+* **+\ (Acol + c) (列偏移):** 移动到列。
+
+**结论:** 由于使用了 K 作为行步长（Leading Dimension），这强烈确认 A 矩阵是按照 **行主序 (Row-Major)** 存储在全局内存中的。
+
+---
+
+## 🎯 II. 为什么是行主序？
+
+在 CUDA 编程中：
+
+* **Host Memory (CPU):** C/C++ 默认使用行主序。
+* **GPU Global Memory:** 当数据从 CPU 传输到 GPU 时，如果数据是 C++ 数组，它通常保持行主序。
+
+**因此，我们可以确定：A 矩阵是行主序存储的。**
 
 //--------------------------------------------------------------------------------------------------
 
@@ -78,6 +718,102 @@ question6:
 不理解，请解释，有例子
 
 
+不理解，请解释，有例子
+
+    // update output
+    for (int r = 0; r < Mr; r++) {
+        for (int c = 0; c < Mc; c++) {
+            if (row0 + r < M && col0 + c < N) {
+                C[(b * M * N) + (row0 + r)* N + col0 + c] = __float2half(acc[r][c]);
+            
+        
+        
+    
+
+answer:
+这段代码是 **半精度批量矩阵乘法 (Batched Half-Precision Matrix Multiplication)** Kernel 的最后阶段，被称为 **Epilogue（尾声）**。它的核心任务是：**将线程累积在寄存器中的最终结果安全地写回到全局内存中的输出矩阵 C。**
+
+-----
+
+## ⚙️ I. 核心目标：安全写回与精度转换
+
+这段代码通过双重循环遍历线程的 8 * 4 寄存器结果块，然后执行以下操作：
+
+1.  **边界检查:** 确保当前写入位置在 C 矩阵的有效范围内。
+2.  **精度转换:** 将 float 结果转换回 half (半精度)。
+3.  **全局写入:** 将结果写入 C 矩阵的正确全局索引。
+
+## 🔢 II. 示例参数设定
+
+| 变量 | 值 | 含义 |
+| :--- | :--- | :--- |
+| M | 512 | 矩阵 C 的总行数 |
+| N | 512 | 矩阵 C 的总列数 (Leading Dimension) |
+| b | 0 | 当前 Batch 索引 |
+| row0 | 64 | 当前 Block 的起始行 |
+| col0 | 32 | 当前 Block 的起始列 |
+| Mr, Mc | 8, 4 | 线程负责的 C 子块尺寸 |
+
+-----
+
+## 🚀 III. 循环与索引分解
+
+### 1\. 遍历寄存器 (r 和 c 循环)
+
+c
+for (int r = 0; r < Mr; r++) { // r 从 0 到 7 (行)
+    for (int c = 0; c < Mc; c++) { // c 从 0 到 3 (列)
+        // ...
+    
+
+
+
+  * **目的:** 确保遍历寄存器数组 acc[r][c] 中的每一个 8 * 4 元素。
+
+### 2\. 边界检查
+
+c
+if (row0 + r < M && col0 + c < N) {
+    // ...
+
+
+
+  * **目的:** 检查当前计算的全局坐标是否在 M * N 矩阵的有效范围内。
+  * **全局坐标:**
+      * **行:** row0 + r
+      * **列:** col0 + c
+  * **示例:**
+      * 假设 M=66， row0=64。当 r=2 时，row0 + r = 66。由于 66 \not< 66，检查失败，跳过写入。
+
+### 3\. 计算最终全局索引 (C)
+
+c
+C[(b * M * N) + (row0 + r)* N + col0 + c]
+
+
+  * **目的:** 这是标准的 Row-Major (行主序) 索引，用于定位 C 矩阵中的目标元素。
+  * **索引分解:**
+    1.  (b * M * N): **Batch 偏移**，跳过前面所有 Batch 的数据。
+    2.  (row0 + r) * N: **行偏移**，跳过 (row0 + r) 行的数据，每行有 N 个元素。
+    3.  + col0 + c: **列偏移**，移动到最终的列。
+
+> **示例:** 线程写入第一个元素 (r=0, c=0, b=0).
+> Index = 0 + (64 + 0) * 512 + (32 + 0) = 32768 + 32 = 32800
+> 线程将结果写入 C 矩阵的第 32800 个位置。
+
+### 4\. 精度转换
+
+c
+= __float2half(acc[r][c]);
+
+
+  * **acc[r][c]:** 这是寄存器中的 `float` (32 位) 结果。
+  * **`__float2half`:** CUDA 内置函数，将 `float` 结果转换为 **`half` (16 位半精度浮点数)**。
+  * **原因:** 优化 Kernel 使用 `float` 累加是为了保证**精度**，但在写回时，必须转换回原始的半精度格式，以满足内存和模型的要求。
+
+## 🎯 总结
+
+这段代码以高效的双重循环和向量化友好的方式，完成了所有计算结果的最终输出：从线程的 **Registers** 中取出数据，进行必要的精度**转换**，并在严格的**边界检查**后，写入 **Global Memory** 中的正确位置。
 
 
 //--------------------------------------------------------------------------------------------------
