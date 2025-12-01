@@ -1,4 +1,83 @@
 
+#include <cuda_runtime.h>
+#include <math.h>
+__global__ void QKTKernel(const float * q,const float* k,float* output,int m ,int n,int d,float alpha)
+{
+    int row=blockIdx.y*blockDim.y+threadIdx.y;
+    int col=blockIdx.x*blockDim.x+threadIdx.x;
+    int index=row*n+col;
+    if(row<m && col<n)
+    {
+        float val=0.0f;
+        for(int i=0;i<d;i++)
+        {
+            val+=q[row*d+i]*k[col*d+i];
+        }
+        val/=sqrtf((float)d);
+        output[index]=val+alpha*(row-col);
+    }
+}
+
+__global__ void SoftmaxKernel(const float * QKt,float * output,int m,int n)
+{
+    int row=blockIdx.x*blockDim.x+threadIdx.x;
+    if(row<m)
+    {
+        float row_max=-INFINITY;
+        for(int col=0;col<n;col++)
+        {
+            row_max=fmaxf(row_max,QKt[row*n+col]);
+        }
+        float sum=0.0f;
+        for(int col=0;col<n;col++)
+        {
+            float val=expf(QKt[row*n+col]-row_max);
+            output[row*n+col]=val;
+            sum+=val;
+        }
+        for(int col=0;col<n;col++)
+        {
+            output[row*n+col]/=sum;
+        }
+    }
+}
+__global__ void SVKernel(const float * S,const float* V,float* output,int m ,int n,int d)
+{
+    int row=blockIdx.y*blockDim.y+threadIdx.y;
+    int col=blockIdx.x*blockDim.x+threadIdx.x;
+    int index=row*d+col;
+    if(row<m && col<d)
+    {
+        float val=0.0f;
+        for(int i=0;i<n;i++)
+        {
+            val+=S[row*n+i]*V[i*d+col];
+        }
+        output[index]=val;
+    }
+}
+
+// Q, K, V, output are device pointers
+extern "C" void solve(const float* Q, const float* K, const float* V, float* output, int M, int N, int d,float alpha) {
+    float * QKT;
+    float * sftmax;
+    cudaMalloc(&QKT,M*N*sizeof(float));
+    cudaMalloc(&sftmax,M*N*sizeof(float));
+    dim3 threads1(16,16);
+    dim3 blocks1((N+threads1.x-1)/threads1.x,(M+threads1.y-1)/threads1.y);
+    QKTKernel<<<blocks1,threads1>>>(Q,K,QKT,M,N,d,alpha);
+    cudaDeviceSynchronize();
+    int threads2=256;
+    int blocks2=(M+threads2-1)/threads2;
+    SoftmaxKernel<<<blocks2,threads2>>>(QKT,sftmax,M,N);
+    cudaDeviceSynchronize();
+    dim3 threads3(16,16);
+    dim3 blocks3((d+threads3.x-1)/threads3.x,(M+threads3.y-1)/threads3.y);
+    SVKernel<<<blocks3,threads3>>>(sftmax,V,output,M,N,d);
+    cudaDeviceSynchronize();
+    cudaFree(QKT);
+    cudaFree(sftmax);
+}
 
 
 
@@ -8,7 +87,133 @@
 question0:
 不理解，请解释，用例子
 
+这段代码实现了一个简化的 **Transformer 注意力机制 (Attention Mechanism)** 的核心计算流程。它将著名的注意力公式分解为三个独立的 CUDA Kernel，并在主机端 (`solve` 函数) 依次调用它们。
 
+**核心公式 (简化):** Attention(Q, K, V) = Softmax（Q*K^T/sqrt{d + Bias) * V
+
+-----
+
+## ⚙️ I. 核心组件与数据流
+
+代码流程遵循三个矩阵运算步骤：
+
+1.  **QKTKernel:** 计算 Q K^T 并进行缩放和偏差项调整。
+2.  **SoftmaxKernel:** 对 Q K^T 结果的每一行应用 Softmax 函数。
+3.  **SVKernel:** 计算 Softmax 结果与 V 矩阵的乘积 (S V)，得到最终输出。
+
+### 矩阵维度定义
+
+  * Q: M * d (查询矩阵)
+  * K: N * d (键矩阵)
+  * V: N * d (值矩阵)
+  * **QK^T (输出):** M * N 矩阵
+
+-----
+
+## 🚀 II. Kernel 1: QK^T 计算 (`QKTKernel`)
+
+这个 Kernel 负责计算 QK^T 的元素，并加入缩放和位置偏差项。
+
+### 1\. 线程分工与索引
+
+```c
+int row=blockIdx.y*blockDim.y+threadIdx.y; // C 矩阵的行索引 (i)
+int col=blockIdx.x*blockDim.x+threadIdx.x; // C 矩阵的列索引 (j)
+if(row<m && col<n) // 边界检查
+```
+
+  * **分工:** 每个线程 (row, col) 负责计算 QK^T 矩阵（输出矩阵）的一个元素 (row, col)。
+  * **核心计算:** QK^T 的 (row, col) 元素等于 Q 矩阵的 row 行与 K 矩阵的 col 行（即 K^T 的 col 列）的**点积**。
+
+### 2\. 点积和缩放
+
+```c
+float val=0.0f;
+for(int i=0;i<d;i++) // i 循环遍历维度 d
+{
+    val+=q[row*d+i]*k[col*d+i]; // 点积累加
+
+val/=sqrtf((float)d); // Scale by 1/sqrt(d)
+output[index]=val+alpha*(row-col); // Add bias
+```
+
+  * **点积:** 循环变量 i 遍历 d 维度，计算 Q 矩阵的 row 行和 K 矩阵的 col 行的点积。
+  * **缩放 (val /= ...):** 按照注意力机制的惯例，点积结果除以 \sqrt{d。
+  * **偏差项 (alpha * (row - col)):** 加上一个简化的**相对位置偏差**项（Self-Attention 中常见的 Bias 变体）。
+
+## 🧠 III. Kernel 2: Softmax (`SoftmaxKernel`)
+
+这个 Kernel 负责对 QK^T 矩阵的**每一行**独立应用 Softmax 函数。
+
+### 1\. 线程分工
+
+```c
+int row=blockIdx.x*blockDim.x+threadIdx.x; // 线程计算的行索引
+if(row<m)
+```
+
+  * **分工:** 每个线程负责计算 QK^T 矩阵的**一行** (即一个序列的 Softmax)。
+  * 由于 Softmax 的计算在行内是独立的，线程使用 **Grid-Stride Loop** 遍历所有行。
+
+### 2\. 数值稳定 Softmax 步骤
+
+标准的 Softmax 是 e^x / (sum e^x)。为了避免数值溢出，代码采用了**减去最大值**的稳定技巧：
+
+  * **计算行最大值 (row_max):**
+    ```c
+    for(int col=0;col<n;col++) { row_max=fmaxf(row_max,QKt[row*n+col]); 
+    ```
+    线程串行遍历当前行，找到最大值 row_max。
+  * **计算指数和 (sum):**
+    ```c
+    float sum=0.0f;
+    for(int col=0;col<n;col++) {
+        float val=expf(QKt[row*n+col]-row_max); // 减去最大值后计算指数
+        output[row*n+col]=val; // 暂时存储 e^(x - x_max)
+        sum+=val; // 计算分母
+    
+    ```
+  * **最终归一化:**
+    ```c
+    for(int col=0;col<n;col++) {
+        output[row*n+col]/=sum; // output[i, j] = e^(x - x_max) / sum
+    
+    ```
+
+## 🏁 IV. Kernel 3: SV 乘积 (`SVKernel`)
+
+这个 Kernel 计算 Softmax 结果 (S) 与 V 矩阵的乘积，得到最终的 Attention 输出。
+
+  * **输入:** S (M * N 矩阵，即 Softmax 输出), V (N * d 矩阵)
+  * **输出:** Output (M * d 矩阵)
+
+<!-- end list -->
+
+```c
+// ... (线程分工与 QKTKernel 类似)
+if(row<m && col<d)
+{
+    float val=0.0f;
+    for(int i=0;i<n;i++) // i 循环遍历内积维度 N
+    {
+        val+=S[row*n+i]*V[i*d+col]; // C[row, col] = sum_i S[row, i] * V[i, col]
+    
+    output[index]=val;
+
+```
+
+  * **分工:** 每个线程负责计算最终输出 Output 矩阵的一个元素 (row, col)。
+  * **核心计算:** 内循环 i 遍历 N 维度，执行矩阵乘法的点积累加。
+
+-----
+
+## 💻 V. 主机端流程 (`solve`)
+
+`solve` 函数是整个 Attention 机制的调度器：
+
+1.  **内存分配:** 为中间结果 QK^T 和 Softmax 输出分配 GPU 内存 (QKT, sftmax)。
+2.  **Kernel 启动:** 严格按照数学顺序依次启动三个 Kernel，并在每次 Kernel 后使用 `cudaDeviceSynchronize()` 确保前一个 Kernel 完成才能启动后一个。
+3.  **内存释放:** 释放中间结果占用的 GPU 内存。
 
 //--------------------------------------------------------------------------------------------------
 
