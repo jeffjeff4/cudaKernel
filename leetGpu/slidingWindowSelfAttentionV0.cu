@@ -1,5 +1,85 @@
 
+#include <cuda_runtime.h>
+#include <stdio.h>
 
+#define BLOCK_THREADS 128
+#define MAX_BUFFER 128 
+
+__global__ void attn_kernel_serial(
+    const float* Q, const float* K, const float* V, float* output, 
+    int M, int d, int window_size
+) {
+    __shared__ float sh_buffer[MAX_BUFFER];
+    __shared__ float sh_softmax_stats[2]; 
+
+    int bx = blockIdx.x; 
+    int tx = threadIdx.x;
+
+    int start = max(0, bx - window_size);
+    int end = min(M, bx + window_size + 1);
+    int num_neighbors = end - start;
+
+    float scale = 1.0f / sqrtf((float)d);
+
+    if (tx < num_neighbors) {
+        int neighbor_idx = start + tx;
+        
+        const float* q_ptr = &Q[bx * d];
+        const float* k_ptr = &K[neighbor_idx * d];
+
+        float dot_sum = 0.0f;
+        
+        for (int k = 0; k < d; k++) {
+            dot_sum += q_ptr[k] * k_ptr[k];
+        }
+
+        sh_buffer[tx] = dot_sum * scale;
+    }
+    __syncthreads();
+
+    if (tx == 0) {
+        float max_val = -INFINITY;
+        for (int i = 0; i < num_neighbors; i++) {
+            max_val = fmaxf(max_val, sh_buffer[i]);
+        }
+        
+        float sum_exp = 0.0f;
+        for (int i = 0; i < num_neighbors; i++) {
+            sum_exp += expf(sh_buffer[i] - max_val);
+        }
+        
+        sh_softmax_stats[0] = max_val;
+        sh_softmax_stats[1] = sum_exp;
+    }
+    __syncthreads();
+
+    float max_val = sh_softmax_stats[0];
+    float sum_exp = sh_softmax_stats[1];
+
+    if (tx < num_neighbors) {
+        float score = sh_buffer[tx];
+        sh_buffer[tx] = expf(score - max_val) / sum_exp;
+    }
+    __syncthreads();
+
+    if (tx < d) {
+        float w_sum = 0.0f;
+        
+        for (int i = 0; i < num_neighbors; i++) {
+            int neighbor_idx = start + i;
+            float weight = sh_buffer[i];
+            float v_val = V[neighbor_idx * d + tx];
+            
+            w_sum += weight * v_val;
+        }
+
+        output[bx * d + tx] = w_sum;
+    }
+}
+
+extern "C" void solve(const float* Q, const float* K, const float* V, float* output, int M, int d, int window_size) {
+    attn_kernel_serial<<<M, BLOCK_THREADS>>>(Q, K, V, output, M, d, window_size);
+}
 
 
 
