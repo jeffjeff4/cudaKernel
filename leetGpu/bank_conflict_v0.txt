@@ -1,0 +1,1023 @@
+================================================================================
+  CUDA SHARED MEMORY BANK CONFLICTS AND XOR SWIZZLING
+  File: bank_conflict_v0.txt
+  Source files:
+    matrixMultiplicationV2_ldg_prefetch.cu   (V1 -- introduces bank conflict)
+    matrixMultiplicationV2_prefetch_v2.cu    (V2 -- XOR swizzle fix)
+================================================================================
+
+QUESTIONS COVERED
+-----------------
+Q1. Explain: sh_a[0][ty][swizzled_tx] = A[a_row * N + a_col];
+
+Q2. Explain: sh_a[next][ty][swizzled_tx] = A[a_row * N + next_a_col];
+            sh_b[next][ty][swizzled_tx] = B[next_b_row * K + b_col];
+
+Q3. Explain: float a0 = sh_a[curr][ty][k ^ ty];
+            float a1 = sh_a[curr][ty][(k + 1) ^ ty];
+            float a2 = sh_a[curr][ty][(k + 2) ^ ty];
+            float a3 = sh_a[curr][ty][(k + 3) ^ ty];
+
+Q4. What is a bank conflict in CUDA? List conditions. Use detailed examples.
+
+================================================================================
+  PART 0 -- CONTEXT: THREE KERNEL VERSIONS
+================================================================================
+
+The project evolved through three versions of a tiled matrix multiply kernel.
+Each version adds one optimization. The bank conflict issue is introduced in V1
+and fixed in V2.
+
+  Version | File                                      | Key change
+  --------+-------------------------------------------+---------------------------
+  V0      | matrixMultiplicationV2.cu                 | Baseline tiled matmul
+  V1      | matrixMultiplicationV2_ldg_prefetch.cu    | +1 padding (stride 17)
+  V2      | matrixMultiplicationV2_prefetch_v2.cu     | XOR swizzle (stride 16)
+
+Settings used throughout:
+  TILE_DIM  = 16
+  Block     = (16, 16)   i.e. blockDim.x = blockDim.y = 16
+  Warp size = 32
+
+A warp in a (16,16) block is 32 consecutive threads:
+  warp 0: ty=0, tx=0..15   AND   ty=1, tx=0..15
+  warp 1: ty=2, tx=0..15   AND   ty=3, tx=0..15
+  ...
+  warp 7: ty=14,tx=0..15   AND   ty=15,tx=0..15
+
+================================================================================
+  PART 1 -- SHARED MEMORY BANKS: FUNDAMENTALS
+================================================================================
+
+A V100/A100/H100 GPU has 32 shared memory banks.
+Each bank is 4 bytes wide (one float).
+
+For any flat array of floats, element at index i is in:
+
+  bank = i % 32
+
+All 32 banks operate IN PARALLEL. If each warp thread hits a different bank,
+all 32 loads/stores happen in 1 cycle.
+
+Physical layout (banks 0..31 repeat every 32 floats):
+
+  Index: 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+  Bank:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+
+  Index:16  17  18  19  20  21  22  23  24  25  26  27  28  29  30  31
+  Bank: 16  17  18  19  20  21  22  23  24  25  26  27  28  29  30  31
+
+  Index:32  33  34  35  36  37  38  39  40  41  42  43  44  45  46  47
+  Bank:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+         ^--- wraps back to bank 0 (32 % 32 = 0)
+
+For a 2D array sh[ROW][COL] with stride S (= number of columns):
+
+  flat index = row * S + col
+  bank       = (row * S + col) % 32
+
+================================================================================
+  PART 2 -- WHAT IS A BANK CONFLICT? CONDITIONS AND RULES
+================================================================================
+
+DEFINITION
+----------
+A bank conflict occurs when two or more threads in the same warp access
+DIFFERENT addresses that map to the SAME bank in the same shared memory
+instruction (load or store).
+
+The hardware SERIALIZES those accesses. An N-way conflict takes N cycles
+instead of 1, reducing throughput by N times.
+
+THE 4 CONDITIONS (all must be true simultaneously)
+---------------------------------------------------
+  Condition 1: The threads are in the SAME WARP (same 32 threads).
+  Condition 2: The accesses happen in the SAME INSTRUCTION (same clock cycle).
+  Condition 3: The threads access DIFFERENT addresses (not the same address).
+  Condition 4: Those different addresses map to the SAME bank.
+
+EXCEPTION: BROADCAST
+---------------------
+If Condition 3 is violated (multiple threads read the EXACT same address),
+the hardware BROADCASTS that value to all requesting threads simultaneously.
+No serialization. No conflict. This is free.
+
+CONFLICT DEGREE
+---------------
+For a uniform stride S across 32 threads (thread i accesses index i*S):
+
+  Conflict degree = gcd(S, 32)
+
+  Stride 1:  gcd(1, 32) = 1  -> no conflict          (ideal)
+  Stride 2:  gcd(2, 32) = 2  -> 2-way conflict
+  Stride 4:  gcd(4, 32) = 4  -> 4-way conflict
+  Stride 8:  gcd(8, 32) = 8  -> 8-way conflict
+  Stride 16: gcd(16,32) = 16 -> 16-way conflict
+  Stride 32: gcd(32,32) = 32 -> 32-way conflict       (worst: 32x slower)
+
+  Stride 3:  gcd(3, 32) = 1  -> no conflict           (odd stride is safe)
+  Stride 5:  gcd(5, 32) = 1  -> no conflict
+  Stride 17: gcd(17,32) = 1  -> no conflict for uniform stride
+             BUT: in a 2D layout (described later) stride 17 DOES cause
+             a 2-way conflict because the pattern is not purely uniform.
+
+PERFORMANCE IMPACT
+------------------
+  No conflict:    1 cycle per shared memory instruction
+  2-way:          2 cycles (2x slower)
+  16-way:         16 cycles (16x slower)
+  32-way:         32 cycles (32x slower)
+
+================================================================================
+  PART 3 -- BANK CONFLICT EXAMPLES
+================================================================================
+
+------------------------------------------------------------------------
+EXAMPLE 1: No Conflict -- Stride 1 (Perfect, Ideal Case)
+------------------------------------------------------------------------
+
+Code:
+  __shared__ float sh[32];
+  float val = sh[threadIdx.x];   // thread i reads sh[i]
+
+Access pattern:
+
+  Thread:  0   1   2   3   4   5  ...  31
+  Index:   0   1   2   3   4   5  ...  31
+  Bank:    0   1   2   3   4   5  ...  31
+
+  All 32 threads hit all 32 different banks.
+  All 32 loads execute simultaneously in 1 cycle.
+  Result: ZERO conflicts.
+
+------------------------------------------------------------------------
+EXAMPLE 2: 2-Way Conflict -- Stride 2
+------------------------------------------------------------------------
+
+Code:
+  __shared__ float sh[64];
+  float val = sh[threadIdx.x * 2];   // thread i reads sh[2*i]
+
+Access pattern:
+
+  Thread:  0   1   2   3   4  ...  15  16  17  18  ...  31
+  Index:   0   2   4   6   8  ...  30  32  34  36  ...  62
+  Bank:    0   2   4   6   8  ...  30   0   2   4  ...  30
+           ^                        ^   ^                ^
+           |________________________|   |________________|
+           Thread 0 and Thread 16       Thread 1 and Thread 17
+           both in bank 0!             both in bank 2!
+
+  Only banks 0, 2, 4, ..., 30 are used (16 banks total).
+  Each bank has exactly 2 threads -> 2-way conflict.
+  Hardware runs in 2 serialized passes:
+    Pass 1: threads 0..15
+    Pass 2: threads 16..31
+  Result: 2x slower than ideal.
+
+------------------------------------------------------------------------
+EXAMPLE 3: 16-Way Conflict -- Stride 16
+------------------------------------------------------------------------
+
+Code:
+  __shared__ float sh[512];
+  float val = sh[threadIdx.x * 16];  // thread i reads sh[16*i]
+
+Access pattern:
+
+  Thread:   0   1   2   3   4   5   6   7  ... 15  16  17  ... 31
+  Index:    0  16  32  48  64  80  96 112  ... 240 256 272  ... 496
+  Bank:     0  16   0  16   0  16   0  16  ...  16   0  16  ...  16
+
+  Only 2 banks used: bank 0 and bank 16.
+  Bank  0 gets threads: 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30
+  Bank 16 gets threads: 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31
+
+  Each bank has 16 threads -> 16-way conflict.
+  Hardware runs in 16 serialized passes.
+  Result: 16x slower than ideal.
+
+------------------------------------------------------------------------
+EXAMPLE 4: 32-Way Conflict -- Stride 32 (Worst Case)
+------------------------------------------------------------------------
+
+Code:
+  __shared__ float sh[1024];
+  float val = sh[threadIdx.x * 32];  // thread i reads sh[32*i]
+
+Access pattern:
+
+  Thread:   0    1    2    3  ...  31
+  Index:    0   32   64   96  ...  992
+  Bank:     0    0    0    0  ...    0
+
+  (every index is a multiple of 32, so i*32 % 32 = 0 for all i)
+
+  ALL 32 threads hit bank 0 with different addresses.
+  32-way conflict -> 32 serialized passes.
+  Result: 32x slower. This is the absolute worst case.
+
+------------------------------------------------------------------------
+EXAMPLE 5: Broadcast -- No Conflict (Same Address)
+------------------------------------------------------------------------
+
+Code:
+  __shared__ float sh[32];
+  float val = sh[5];   // ALL 32 threads read the exact same element
+
+Access pattern:
+
+  Thread:  0   1   2   3  ...  31
+  Index:   5   5   5   5  ...   5
+  Bank:    5   5   5   5  ...   5
+
+  Same address -> hardware BROADCASTS.
+  One read feeds all 32 threads.
+  Condition 3 (different addresses) is NOT met -> no conflict.
+  Result: ZERO conflicts. Costs 1 cycle (same as no conflict).
+
+------------------------------------------------------------------------
+EXAMPLE 6: 2D Array -- Row Access (No Conflict)
+------------------------------------------------------------------------
+
+  __shared__ float sh[16][16];   // stride = 16 columns per row
+  float val = sh[threadIdx.y][threadIdx.x];
+
+In a (16,16) block, warp 0 = ty=0,tx=0..15 AND ty=1,tx=0..15:
+
+  Thread          Address       Flat index       Bank
+  (ty=0, tx=0)  -> sh[0][0]     0*16+ 0 =  0    bank  0
+  (ty=0, tx=1)  -> sh[0][1]     0*16+ 1 =  1    bank  1
+  (ty=0, tx=2)  -> sh[0][2]     0*16+ 2 =  2    bank  2
+  ...
+  (ty=0, tx=15) -> sh[0][15]    0*16+15 = 15    bank 15
+  (ty=1, tx=0)  -> sh[1][0]     1*16+ 0 = 16    bank 16
+  (ty=1, tx=1)  -> sh[1][1]     1*16+ 1 = 17    bank 17
+  ...
+  (ty=1, tx=15) -> sh[1][15]    1*16+15 = 31    bank 31
+
+  All 32 threads -> banks 0..31, each exactly once.
+  Result: ZERO conflicts. Ideal.
+
+------------------------------------------------------------------------
+EXAMPLE 7: 2D Array -- Column Access (16-Way Conflict)
+------------------------------------------------------------------------
+
+  __shared__ float sh[32][16];   // 32 rows, 16 cols, stride = 16
+  float val = sh[threadIdx.x][0];  // all read column 0, different rows
+
+  Thread i reads sh[i][0]:
+    flat = i*16 + 0 = 16*i
+    bank = (16*i) % 32
+
+  Thread:   0   1   2   3   4   5   6   7   8  ...  15  16  17  ...  31
+  Index:    0  16  32  48  64  80  96 112 128  ... 240 256 272  ... 496
+  Bank:     0  16   0  16   0  16   0  16   0  ...  16   0  16  ...  16
+
+  Same pattern as Example 3 (stride 16) -> 16-way conflict.
+
+  This is the classic "column access" bank conflict.
+  It happens whenever you read a column from a row-major 2D array.
+
+------------------------------------------------------------------------
+EXAMPLE 8: 2D + Padding (Stride 17) -- The V1 Bug
+------------------------------------------------------------------------
+
+From matrixMultiplicationV2_ldg_prefetch.cu:
+
+  __shared__ float sh_a[2][TILE_DIM][TILE_DIM + 1];  // stride = 17
+
+Warp 0 writes sh_a[0][ty][tx] with stride 17:
+
+  Thread           Address         Flat index            Bank
+  (ty=0, tx=0)  -> sh_a[0][0][0]   0*17+ 0 =  0        bank  0  <---
+  (ty=0, tx=1)  -> sh_a[0][0][1]   0*17+ 1 =  1        bank  1
+  (ty=0, tx=2)  -> sh_a[0][0][2]   0*17+ 2 =  2        bank  2
+  ...
+  (ty=0, tx=14) -> sh_a[0][0][14]  0*17+14 = 14        bank 14
+  (ty=0, tx=15) -> sh_a[0][0][15]  0*17+15 = 15        bank 15
+  (ty=1, tx=0)  -> sh_a[0][1][0]   1*17+ 0 = 17        bank 17
+  (ty=1, tx=1)  -> sh_a[0][1][1]   1*17+ 1 = 18        bank 18
+  ...
+  (ty=1, tx=13) -> sh_a[0][1][13]  1*17+13 = 30        bank 30
+  (ty=1, tx=14) -> sh_a[0][1][14]  1*17+14 = 31        bank 31
+  (ty=1, tx=15) -> sh_a[0][1][15]  1*17+15 = 32        bank  0  <---
+
+  ty=0,tx=0  -> flat =  0, bank = 0
+  ty=1,tx=15 -> flat = 32, bank = 0  (32 % 32 = 0)
+
+  DIFFERENT addresses (0 vs 32), SAME bank (0) -> 2-WAY CONFLICT!
+
+  The +1 padding intended to fix conflicts from the original kernel
+  but introduced a NEW 2-way conflict between (ty=0,tx=0) and (ty=1,tx=15).
+
+  Note: gcd(17, 32) = 1 says uniform stride 17 is conflict-free.
+  This conflict is a 2D LAYOUT effect: the 2-row warp packs 32 accesses
+  with non-uniform stride (16 accesses at stride 1 in one row, then a jump
+  of 2 to the next row's start, then 16 more). The last element of row 1
+  (flat = 32) wraps back to bank 0 and conflicts with the first of row 0.
+
+------------------------------------------------------------------------
+EXAMPLE 9: XOR Swizzle (Stride 16) -- V2 Fix, Zero Conflicts
+------------------------------------------------------------------------
+
+From matrixMultiplicationV2_prefetch_v2.cu:
+
+  __shared__ float sh_a[2][TILE_DIM][TILE_DIM];   // stride = 16, NO padding
+  int swizzled_tx = tx ^ ty;
+  sh_a[0][ty][swizzled_tx] = A[...];
+
+Warp 0 writes to sh_a[0][ty][tx ^ ty]:
+
+  Thread           swizzled_col    Flat index            Bank
+  (ty=0, tx=0)  -> 0^0  =  0      0*16+ 0 =  0         bank  0
+  (ty=0, tx=1)  -> 1^0  =  1      0*16+ 1 =  1         bank  1
+  (ty=0, tx=2)  -> 2^0  =  2      0*16+ 2 =  2         bank  2
+  (ty=0, tx=3)  -> 3^0  =  3      0*16+ 3 =  3         bank  3
+  ...
+  (ty=0, tx=14) -> 14^0 = 14      0*16+14 = 14         bank 14
+  (ty=0, tx=15) -> 15^0 = 15      0*16+15 = 15         bank 15
+
+  (ty=1, tx=0)  -> 0^1  =  1      1*16+ 1 = 17         bank 17
+  (ty=1, tx=1)  -> 1^1  =  0      1*16+ 0 = 16         bank 16
+  (ty=1, tx=2)  -> 2^1  =  3      1*16+ 3 = 19         bank 19
+  (ty=1, tx=3)  -> 3^1  =  2      1*16+ 2 = 18         bank 18
+  (ty=1, tx=4)  -> 4^1  =  5      1*16+ 5 = 21         bank 21
+  (ty=1, tx=5)  -> 5^1  =  4      1*16+ 4 = 20         bank 20
+  ...
+  (ty=1, tx=14) -> 14^1 = 15      1*16+15 = 31         bank 31
+  (ty=1, tx=15) -> 15^1 = 14      1*16+14 = 30         bank 30
+
+  ty=0 uses banks: { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+  ty=1 uses banks: {16,17,18,19,20,21,22,23,24,25, 26, 27, 28, 29, 30, 31}
+
+  All 32 threads -> 32 different banks, each exactly once.
+  Result: ZERO conflicts. No extra memory wasted.
+
+  Key: ty=1,tx=15 -> bank 30 (NOT bank 0 as in the V1 bug).
+
+================================================================================
+  PART 4 -- THE FULL KERNEL CODE (V2 SWIZZLE)
+================================================================================
+
+// matrixMultiplicationV2_prefetch_v2.cu (relevant kernel only)
+
+__global__ void matmul_prefetch_v2_swizzle(
+    const float* A, const float* B, float* C, int M, int N, int K)
+{
+    // Double-buffered shared memory -- NO padding needed with XOR swizzle
+    __shared__ float sh_a[2][TILE_DIM][TILE_DIM];
+    __shared__ float sh_b[2][TILE_DIM][TILE_DIM];
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+
+    int num_tiles = (N + TILE_DIM - 1) / TILE_DIM;
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+
+    // ---- XOR swizzle: computed once, reused everywhere ----
+    int swizzled_tx = tx ^ ty;
+
+    // ---- Preload first tile into buffer[0] ----
+    int a_col = tx;
+    int a_row = blockIdx.y * TILE_DIM + ty;
+    if (a_col < N && a_row < M)
+        sh_a[0][ty][swizzled_tx] = A[a_row * N + a_col];    // Q1
+    else
+        sh_a[0][ty][swizzled_tx] = 0.0f;
+
+    int b_row = ty;
+    int b_col = blockIdx.x * TILE_DIM + tx;
+    if (b_row < N && b_col < K)
+        sh_b[0][ty][swizzled_tx] = B[b_row * K + b_col];
+    else
+        sh_b[0][ty][swizzled_tx] = 0.0f;
+
+    __syncthreads();
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        int curr = tile & 1;
+        int next = 1 - curr;
+
+        // ---- Prefetch next tile into buffer[next] ----
+        if (tile + 1 < num_tiles) {
+            int next_a_col = (tile + 1) * TILE_DIM + tx;
+            if (next_a_col < N && a_row < M)
+                sh_a[next][ty][swizzled_tx] = A[a_row * N + next_a_col]; // Q2
+            else
+                sh_a[next][ty][swizzled_tx] = 0.0f;
+
+            int next_b_row = (tile + 1) * TILE_DIM + ty;
+            if (next_b_row < N && b_col < K)
+                sh_b[next][ty][swizzled_tx] = B[next_b_row * K + b_col]; // Q2
+            else
+                sh_b[next][ty][swizzled_tx] = 0.0f;
+        }
+        __syncthreads();
+
+        // ---- Compute with de-swizzled reads ----
+        #pragma unroll
+        for (int k = 0; k < TILE_DIM; k += 4) {
+            float a0 = sh_a[curr][ty][k ^ ty];           // Q3
+            float a1 = sh_a[curr][ty][(k + 1) ^ ty];
+            float a2 = sh_a[curr][ty][(k + 2) ^ ty];
+            float a3 = sh_a[curr][ty][(k + 3) ^ ty];
+
+            float b0 = sh_b[curr][k    ][tx ^ k];
+            float b1 = sh_b[curr][k + 1][tx ^ (k + 1)];
+            float b2 = sh_b[curr][k + 2][tx ^ (k + 2)];
+            float b3 = sh_b[curr][k + 3][tx ^ (k + 3)];
+
+            sum += a0*b0 + a1*b1 + a2*b2 + a3*b3;
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < K)
+        C[row * K + col] = sum;
+}
+
+================================================================================
+  PART 5 -- QUESTION 1: sh_a[0][ty][swizzled_tx] = A[a_row * N + a_col]
+================================================================================
+
+CODE (preload tile 0 before the main loop):
+
+    int swizzled_tx = tx ^ ty;
+
+    int a_col = tx;
+    int a_row = blockIdx.y * TILE_DIM + ty;
+    if (a_col < N && a_row < M)
+        sh_a[0][ty][swizzled_tx] = A[a_row * N + a_col];
+
+PURPOSE
+-------
+Load the FIRST tile of matrix A into shared memory buffer [0], using
+the XOR-swizzled column index to eliminate bank conflicts on the write.
+
+WHAT swizzled_tx MEANS
+-----------------------
+  swizzled_tx = tx ^ ty   (XOR of thread column index and thread row index)
+
+XOR is bitwise-exclusive-OR:
+  0 ^ 0 = 0    (binary 000 ^ 000 = 000)
+  1 ^ 0 = 1
+  5 ^ 3 = 6    (binary 101 ^ 011 = 110)
+
+The key property: XOR with a constant is a BIJECTION (1-to-1 mapping).
+  For fixed ty, the set { tx ^ ty : tx = 0..15 } = { 0..15 }
+  (just a permutation -- all 16 values still present, in different order)
+
+Examples:
+  ty=0: swizzled_tx = tx ^ 0 = tx          (no change: 0,1,2,...,15)
+  ty=1: swizzled_tx = tx ^ 1               (flip bit0: 1,0,3,2,5,4,...,14,15)
+  ty=2: swizzled_tx = tx ^ 2               (flip bit1: 2,3,0,1,6,7,4,5,...)
+  ty=3: swizzled_tx = tx ^ 3               (flip bit0&1: 3,2,1,0,7,6,5,4,...)
+
+Each row of shared memory still stores 16 elements (all 16 tile columns),
+but in a PERMUTED ORDER. Different rows use different permutations.
+
+WHY THIS FIXES THE BANK CONFLICT
+---------------------------------
+Without swizzle (V1, stride 17): ty=0,tx=0 -> bank 0; ty=1,tx=15 -> bank 0.
+  CONFLICT: two threads, different addresses, same bank.
+
+With swizzle (V2, stride 16):
+  ty=0,tx=0  -> swizzled=0,  flat=0*16+0=0,   bank=0
+  ty=1,tx=15 -> swizzled=14, flat=1*16+14=30, bank=30
+  NO conflict.
+
+The swizzle scrambles which column index each thread writes to in shared
+memory, ensuring the 32 threads in a warp always land on 32 different banks.
+
+CONCRETE TRACE: Tile 0, block by=0, ty=3, tx=7
+-----------------------------------------------
+  swizzled_tx = 7 ^ 3 = 4  (binary 111 ^ 011 = 100)
+
+  a_col = tx = 7           (column 7 of tile 0 in A = global column 7)
+  a_row = 0*16 + 3 = 3     (global row 3 of A)
+
+  Reads:  A[3 * N + 7]     (element at row 3, col 7 of A)
+  Writes: sh_a[0][3][4]    (stored at shared row 3, shared column 4)
+
+The element that mathematically belongs at sh_a[row=3][col=7] is stored
+at sh_a[row=3][col=4]. This is the "scrambled" position.
+
+DATA LAYOUT WITH SWIZZLE
+-------------------------
+For row ty (all tx=0..15 writing their element):
+
+  Global A column:     0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+  Swizzled position:   0^ty 1^ty 2^ty 3^ty 4^ty 5^ty 6^ty 7^ty 8^ty ...
+  (for ty=3):          3    2    1    0    7    6    5    4   11   10    9    8   15   14   13   12
+
+  sh_a[3][position]:    3    2    1    0    7    6    5    4   11   10    9    8   15   14   13   12
+  contains A column:    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15
+
+sh_a[3][position p] contains A's column (p ^ 3) -- because tx^ty stored at p means p=tx^ty -> tx=p^ty.
+
+================================================================================
+  PART 6 -- QUESTION 2: sh_a[next][ty][swizzled_tx] AND sh_b[next][ty][swizzled_tx]
+           (Double-Buffered Prefetch Writes)
+================================================================================
+
+CODE (inside the tile loop):
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        int curr = tile & 1;
+        int next = 1 - curr;
+
+        if (tile + 1 < num_tiles) {
+            int next_a_col = (tile + 1) * TILE_DIM + tx;
+            if (next_a_col < N && a_row < M)
+                sh_a[next][ty][swizzled_tx] = A[a_row * N + next_a_col];
+
+            int next_b_row = (tile + 1) * TILE_DIM + ty;
+            if (next_b_row < N && b_col < K)
+                sh_b[next][ty][swizzled_tx] = B[next_b_row * K + b_col];
+        }
+        __syncthreads();
+
+        // ... compute from sh_a[curr], sh_b[curr] ...
+        __syncthreads();
+    }
+
+DOUBLE BUFFERING (PING-PONG) MECHANISM
+---------------------------------------
+The shared memory has TWO buffers for each matrix:
+
+  sh_a[2][TILE_DIM][TILE_DIM]
+       ^
+       0 or 1 -- the buffer index
+
+Idea: while computing from one buffer (curr), load the next tile into
+the OTHER buffer (next). The two buffers alternate roles every iteration.
+
+curr and next:
+
+  tile=0: curr = 0&1 = 0,  next = 1-0 = 1
+  tile=1: curr = 1&1 = 1,  next = 1-1 = 0
+  tile=2: curr = 2&1 = 0,  next = 1-0 = 1
+  tile=3: curr = 3&1 = 1,  next = 1-1 = 0
+
+  They always point to different buffers. curr reads, next writes.
+
+FLOW ACROSS ITERATIONS (example: num_tiles=4)
+----------------------------------------------
+  Before loop:
+    Load tile 0 -> sh_a[0], sh_b[0]
+    __syncthreads()
+
+  tile=0: curr=0, next=1
+    WRITE tile 1 -> sh_a[1], sh_b[1]    (next=1)
+    __syncthreads()
+    COMPUTE from sh_a[0], sh_b[0]        (curr=0)
+    __syncthreads()
+
+  tile=1: curr=1, next=0
+    WRITE tile 2 -> sh_a[0], sh_b[0]    (next=0)
+    __syncthreads()
+    COMPUTE from sh_a[1], sh_b[1]        (curr=1)
+    __syncthreads()
+
+  tile=2: curr=0, next=1
+    WRITE tile 3 -> sh_a[1], sh_b[1]
+    __syncthreads()
+    COMPUTE from sh_a[0], sh_b[0]
+    __syncthreads()
+
+  tile=3: curr=1, next=0
+    (tile+1=4 >= num_tiles -> no write)
+    __syncthreads()
+    COMPUTE from sh_a[1], sh_b[1]
+    __syncthreads()
+
+Buffers never conflict: curr is READ-ONLY during compute, next is WRITE-ONLY
+during prefetch, and they always point to different buffer slots (0 vs 1).
+
+ASCII TIMELINE:
+
+  Buffer [0]:  [FILL tile0]  [COMPUTE]  [FILL tile2]  [COMPUTE]
+  Buffer [1]:               [FILL tile1]  [COMPUTE]  [FILL tile3]  [COMPUTE]
+                ^             ^
+             before loop    tile=0 iter
+
+WHAT next_a_col AND next_b_row DO
+----------------------------------
+These compute the global addresses for tile+1 (one tile ahead):
+
+  Original (for current tile):   a_col     = tile * TILE_DIM + tx
+  Prefetch (for next tile):      next_a_col = (tile+1) * TILE_DIM + tx
+
+  Original (for current tile):   b_row     = tile * TILE_DIM + ty
+  Prefetch (for next tile):      next_b_row = (tile+1) * TILE_DIM + ty
+
+Concrete trace (tx=3, ty=5, TILE_DIM=16):
+
+  tile=0:  a_col     = 0*16+3 = 3    (A column 3,  current tile)
+           next_a_col = 1*16+3 = 19  (A column 19, next tile)
+           b_row     = 0*16+5 = 5    (B row 5,  current tile)
+           next_b_row = 1*16+5 = 21  (B row 21, next tile)
+
+  tile=1:  a_col     = 1*16+3 = 19
+           next_a_col = 2*16+3 = 35
+           b_row     = 1*16+5 = 21
+           next_b_row = 2*16+5 = 37
+
+Notice: next_a_col at tile=0 equals a_col at tile=1. You are loading
+what tile=1 will need, one iteration before tile=1 executes.
+
+SWIZZLE DURING PREFETCH
+------------------------
+  sh_a[next][ty][swizzled_tx] = A[a_row * N + next_a_col];
+
+swizzled_tx = tx ^ ty (computed once before the loop, never changes).
+The bank layout is IDENTICAL to the initial load in Q1.
+All 32 threads in the warp still land on 32 different banks every time.
+
+The swizzle is independent of which tile or which buffer -- it only
+depends on thread ID (ty and tx), which is constant per thread.
+
+================================================================================
+  PART 7 -- QUESTION 3: sh_a[curr][ty][k ^ ty]  (De-Swizzle on Read)
+================================================================================
+
+CODE (inside the compute inner loop):
+
+    for (int k = 0; k < TILE_DIM; k += 4) {
+        float a0 = sh_a[curr][ty][k ^ ty];
+        float a1 = sh_a[curr][ty][(k + 1) ^ ty];
+        float a2 = sh_a[curr][ty][(k + 2) ^ ty];
+        float a3 = sh_a[curr][ty][(k + 3) ^ ty];
+
+        float b0 = sh_b[curr][k    ][tx ^ k];
+        float b1 = sh_b[curr][k + 1][tx ^ (k + 1)];
+        float b2 = sh_b[curr][k + 2][tx ^ (k + 2)];
+        float b3 = sh_b[curr][k + 3][tx ^ (k + 3)];
+
+        sum += a0*b0 + a1*b1 + a2*b2 + a3*b3;
+    }
+
+WHAT THE COMPUTE LOOP COMPUTES
+--------------------------------
+This is a tiled matrix multiply. For one tile (16 columns of A, 16 rows of B):
+
+  sum += A[row][tile*16 + 0] * B[tile*16 + 0][col]
+       + A[row][tile*16 + 1] * B[tile*16 + 1][col]
+       + ...
+       + A[row][tile*16 + 15] * B[tile*16 + 15][col]
+
+In the loop, k=0,4,8,12. For each k, we compute 4 multiply-adds.
+A's values come from sh_a (loaded earlier). B's values from sh_b.
+
+WHY [k ^ ty] -- THE DE-SWIZZLE
+--------------------------------
+During the WRITE (Q1), thread (ty, tx) stored A's column tx at:
+  sh_a[ty][ tx ^ ty ]
+
+So sh_a[ty][position] stores A's column (position ^ ty):
+  sh_a[ty][p] = A_value_at_tile_column (p ^ ty)
+
+To read A's tile column k, we need p such that (p ^ ty) = k:
+  p ^ ty = k
+  p      = k ^ ty   (XOR both sides by ty; since a ^ a = 0, XOR is its own inverse)
+
+So: sh_a[ty][k ^ ty] = A's tile column k.
+
+That is the de-swizzle. XOR swizzle and de-swizzle use the SAME operation
+(XOR with ty) because XOR is self-inverse: applying it twice returns the
+original value.
+
+  store:   position = tx ^ ty   (scrambled)
+  load:    position = k  ^ ty   (un-scramble to get k)
+
+CONCRETE EXAMPLE: ty=3, k=5
+-----------------------------
+  During write: tx=5 stored at sh_a[3][5^3=6]
+    sh_a[3][6] = A's tile column 5
+
+  During read: k=5 -> read sh_a[3][5^3=6]
+    sh_a[3][6] -> A's tile column 5   CORRECT!
+
+CONCRETE EXAMPLE: ty=2, k=0,1,2,3
+-----------------------------------
+  a0 = sh_a[curr][2][0^2] = sh_a[curr][2][2] = A's tile col 0
+  a1 = sh_a[curr][2][1^2] = sh_a[curr][2][3] = A's tile col 1
+  a2 = sh_a[curr][2][2^2] = sh_a[curr][2][0] = A's tile col 2
+  a3 = sh_a[curr][2][3^2] = sh_a[curr][2][1] = A's tile col 3
+
+  The read indices (2,3,0,1) are a permutation of (0,1,2,3).
+  The CORRECT values are retrieved, just in scrambled order from memory.
+
+THE B MATRIX DE-SWIZZLE
+------------------------
+B is written with swizzle:
+  sh_b[ty][tx ^ ty] = B_value_at_tile_row_ty_col_tx
+
+So sh_b[row][p] = B's tile column (p ^ row).
+To read B's element at tile row k, tile col tx:
+  We need to read sh_b[k][tx ^ k]
+
+That is why:
+  b0 = sh_b[curr][k    ][tx ^ k]
+  b1 = sh_b[curr][k + 1][tx ^ (k + 1)]
+  ...
+
+Here the de-swizzle key is k (the row of B being read), not ty.
+
+BANK CONFLICT ANALYSIS ON READS
+---------------------------------
+For sh_a[curr][ty][k ^ ty]:
+
+All 32 threads in warp 0 at the same k:
+  ty=0 (16 threads): all read sh_a[curr][0][k^0] = sh_a[curr][0][k]
+    -> same address -> BROADCAST -> no conflict
+  ty=1 (16 threads): all read sh_a[curr][1][k^1]
+    -> same address -> BROADCAST -> no conflict
+
+  ty=0 read: flat = 0*16+k,     bank = k
+  ty=1 read: flat = 1*16+(k^1), bank = 16+(k^1)
+
+  Are these the same bank? Only if k = 16+(k^1) (mod 32).
+  For k=0:  ty=0 bank=0,  ty=1 bank=16+(0^1)=17  -> different. OK.
+  For k=1:  ty=0 bank=1,  ty=1 bank=16+(1^1)=16  -> different. OK.
+  For k=15: ty=0 bank=15, ty=1 bank=16+(15^1)=30 -> different. OK.
+  Never the same. ZERO conflicts.
+
+For sh_b[curr][k][tx ^ k]:
+
+All 32 threads at same k:
+  ty=0, tx=0..15 read sh_b[curr][k][0^k..15^k]
+    flat = k*16 + (tx^k), different tx -> 16 different flat indices
+    since {tx^k: tx=0..15} is a permutation of {0..15}
+    -> flat = {k*16+0, k*16+1, ..., k*16+15} in some order -> 16 banks
+  ty=1, tx=0..15 read SAME addresses as ty=0 -> BROADCAST -> no conflict
+  Result: ZERO conflicts.
+
+================================================================================
+  PART 8 -- XOR PROPERTIES USED IN THIS CODE
+================================================================================
+
+XOR (^) rules used:
+
+  a ^ 0 = a             (XOR with 0 is identity)
+  a ^ a = 0             (XOR with self is 0)
+  a ^ b = b ^ a         (commutative)
+  (a ^ b) ^ b = a       (XOR is self-inverse -- applying twice returns original)
+
+Why the de-swizzle works:
+  Store:  position p = tx ^ ty
+  Load:   position   = k  ^ ty
+    When k = tx: position = tx ^ ty = p  (same position as stored)
+    Self-inverse: (tx ^ ty) ^ ty = tx ^ (ty ^ ty) = tx ^ 0 = tx
+
+Why XOR distributes banks evenly:
+  For fixed ty, the function f(tx) = tx ^ ty is a bijection on {0..15}.
+  It maps {0..15} to {0..15} (a permutation).
+  So the 16 threads with different tx values always access 16 different
+  columns, landing on 16 different banks.
+
+XOR table for ty=3 (binary 011):
+
+  tx:           0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+  tx^3:         3   2   1   0   7   6   5   4  11  10   9   8  15  14  13  12
+  (bijection -- every value 0..15 appears exactly once)
+
+================================================================================
+  PART 9 -- FULL DATA FLOW: STORE AND RETRIEVE ROUND-TRIP
+================================================================================
+
+Using ty=5 (binary 0101), tx=9 (binary 1001), k=9 as example:
+
+  TILE_DIM = 16, TILE_DIM = 16
+
+  STORE (Q1 or Q2 -- preload or prefetch):
+    swizzled_tx = tx ^ ty = 9 ^ 5 = 12  (binary 1001 ^ 0101 = 1100)
+    sh_a[buffer][5][12] = A[a_row * N + 9]
+    "A's tile column 9 is stored at shared column 12"
+
+  COMPUTE (Q3 -- de-swizzle read):
+    k = 9, ty = 5
+    read_idx = k ^ ty = 9 ^ 5 = 12
+    val = sh_a[curr][5][12]   -> retrieves A's tile column 9. CORRECT!
+
+Verify: 12 ^ 5 = 9 (de-swizzle works).
+
+Another example: ty=7, tx=4, k=4:
+  Store: swizzled_tx = 4^7 = 3. sh_a[b][7][3] = A_col_4.
+  Read:  k^ty = 4^7 = 3. sh_a[curr][7][3] -> A_col_4. CORRECT!
+
+================================================================================
+  PART 10 -- ERRORS, ROOT CAUSES, AND BUG FIXES
+================================================================================
+
+------------------------------------------------------------------------
+ERROR 1 (V0 -> V1 transition, padding bug)
+------------------------------------------------------------------------
+File:        matrixMultiplicationV2_ldg_prefetch.cu
+Description: The +1 padding intended to fix conflicts introduced a new one.
+
+  WHAT WAS INTENDED:
+    The original kernel sh_a[16][16] was believed to have bank conflicts
+    (likely during column-style access in some compute patterns).
+    Adding +1 padding to make sh_a[16][17] (stride 17) was applied as
+    a standard fix (odd strides avoid conflicts for uniform stride).
+
+  THE BUG:
+    With a 16x16 thread block, warp 0 has 32 threads:
+      ty=0, tx=0..15   and   ty=1, tx=0..15
+
+    These write to sh_a[ty][tx] but with stride 17:
+      ty=0, tx=0  -> flat = 0*17 + 0  = 0,  bank = 0   <---
+      ty=1, tx=15 -> flat = 1*17 + 15 = 32, bank = 0   <---
+
+    DIFFERENT addresses (flat 0 vs flat 32), SAME bank (0).
+    -> 2-WAY BANK CONFLICT on every warp's load/store.
+
+  ROOT CAUSE:
+    The 2D warp layout (two rows of 16 threads) combined with stride 17
+    causes the LAST element of row ty=1 (flat = 1*17+15 = 32) to wrap
+    back to bank 0 (32 % 32 = 0), conflicting with the FIRST element
+    of row ty=0 (flat = 0).
+
+    gcd(17, 32) = 1 predicts NO conflict for a pure stride-17 pattern
+    across 32 threads, but the warp's actual access is NOT a uniform
+    stride pattern -- it is two separate 16-element rows. The formula
+    applies to the row boundary, not within a row.
+
+  IMPACT:
+    Every tile load has a 2-way bank conflict.
+    This costs 2x the cycles for every shared memory write during loading.
+
+  FIX (V2):
+    Use XOR swizzling instead of padding.
+    Remove the +1 padding. Use sh_a[2][16][16] (stride 16).
+    Write to sh_a[ty][tx ^ ty] instead of sh_a[ty][tx].
+    This guarantees all 32 warp threads hit 32 different banks.
+
+------------------------------------------------------------------------
+ERROR 2 (Conceptual: wrong de-swizzle would break correctness)
+------------------------------------------------------------------------
+This is not a code bug (the code is correct), but a common mistake to avoid.
+
+  WRONG read (if you forgot de-swizzle):
+    float a0 = sh_a[curr][ty][k];       // reads position k directly
+    This retrieves A's column (k ^ ty), NOT A's column k.
+    The dot product sum would be INCORRECT -- wrong column order.
+
+  ROOT CAUSE:
+    After swizzled write, the data is stored at permuted positions.
+    Reading at the logical (unswizzled) position gives the wrong value.
+
+  FIX:
+    Always de-swizzle on read: sh_a[curr][ty][k ^ ty].
+    Store and load must use the same XOR key (ty for A, k for B).
+
+------------------------------------------------------------------------
+ERROR 3 (B matrix: different XOR key from A)
+------------------------------------------------------------------------
+A uses ty as the XOR key. B uses k (the loop variable) as the XOR key.
+These are DIFFERENT and cannot be swapped.
+
+  WHY A uses ty:
+    A is stored as sh_a[ty][tx ^ ty].
+    The row dimension is ty. The XOR key is ty (the row of the element).
+    On read, to recover A[row=ty][col=k]: sh_a[ty][k ^ ty].
+
+  WHY B uses k:
+    B is stored as sh_b[ty][tx ^ ty].
+    But during COMPUTE, B is accessed as sh_b[k][tx ^ k]:
+      row = k (the k-dimension, NOT ty)
+    B was written at row ty, swizzled by ty.
+    When reading at row k, the XOR key for that row is k (not ty).
+
+    sh_b[k][p] stores B's column (p ^ k) -- because when it was written,
+    ty=k and swizzled_tx = tx ^ k.
+    To retrieve B's column tx: p = tx ^ k.
+
+  WRONG read for B would be:
+    sh_b[curr][k][tx ^ ty]   // uses ty as key, but B row is k
+    This retrieves the wrong column.
+
+  CORRECT read:
+    sh_b[curr][k][tx ^ k]    // uses k as key (matches B's storage XOR key)
+
+------------------------------------------------------------------------
+ERROR 4 (Logical: missing __syncthreads() placement)
+------------------------------------------------------------------------
+The code has two __syncthreads() per loop iteration:
+  1. After the prefetch writes (before compute reads)
+  2. After the compute reads (before next prefetch writes)
+
+  WRONG (only 1 sync):
+    Write to sh_a[next]... (load next tile)
+    // missing sync here!
+    Read from sh_a[curr]... (compute)
+    __syncthreads()
+
+    Even though curr != next, some threads may not have finished writing
+    sh_a[next] before the NEXT iteration starts and reads sh_a[curr]
+    which by then is the old next. Race condition.
+
+  ROOT CAUSE:
+    Two __syncthreads() are needed because:
+    Sync 1: Ensure all writes to sh_a[next] complete before any thread reads.
+    Sync 2: Ensure all reads from sh_a[curr] complete before the next iteration
+            writes into what will become sh_a[next] (i.e., the same buffer).
+
+  FIX (as in the code):
+    Write next tile -> __syncthreads() -> Compute curr tile -> __syncthreads()
+
+------------------------------------------------------------------------
+SUMMARY OF ALL ERRORS
+------------------------------------------------------------------------
+
+  Error | File       | Bug                          | Root Cause                     | Fix
+  ------+------------+------------------------------+--------------------------------+-------------------------
+  1     | ldg_pref   | +1 padding causes 2-way      | Last elem of ty=1 row (flat=32)| Use XOR swizzle instead
+        |            | bank conflict on load/store  | wraps to bank 0 = ty=0 elem 0  | of padding
+  ------+------------+------------------------------+--------------------------------+-------------------------
+  2     | v2_swizzle | Wrong read [k] instead       | Swizzled storage needs matching| Always de-swizzle on
+        | (avoid)    | of [k ^ ty] -> wrong value   | de-swizzle on read             | read: sh_a[ty][k^ty]
+  ------+------------+------------------------------+--------------------------------+-------------------------
+  3     | v2_swizzle | Using ty as B's XOR key      | B stored with ty as key but    | Use k as XOR key for B:
+        | (avoid)    | instead of k -> wrong column | accessed at row k during compute| sh_b[k][tx^k]
+  ------+------------+------------------------------+--------------------------------+-------------------------
+  4     | general    | Missing one __syncthreads()  | Double buffer curr/next can     | Two syncs: after write,
+        | (avoid)    | causes race condition         | alias in next iteration        | after compute
+
+================================================================================
+  PART 11 -- COMPARISON TABLE: THREE VERSIONS
+================================================================================
+
+  Feature                    | V0 (original)      | V1 (LDG + pad)     | V2 (XOR swizzle)
+  ---------------------------+--------------------+--------------------+--------------------
+  sh_a shape                 | [16][16]           | [2][16][17]        | [2][16][16]
+  Stride                     | 16                 | 17                 | 16
+  Bank conflicts on load?    | None               | YES (2-way)        | None
+  Bank conflicts on compute? | None               | None               | None
+  Extra memory per matrix    | 0 bytes            | 2*16*4=128 bytes   | 0 bytes
+  Write index                | sh[ty][tx]         | sh[ty][tx]         | sh[ty][tx^ty]
+  Read index (A)             | sh[ty][k]          | sh[ty][k]          | sh[ty][k^ty]
+  Read index (B)             | sh[k][tx]          | sh[k][tx]          | sh[k][tx^k]
+  Double buffering           | No                 | Yes                | Yes
+  __ldg() cache hint         | No                 | Yes                | Yes
+
+================================================================================
+  PART 12 -- BANK CONFLICT QUICK REFERENCE
+================================================================================
+
+CONDITIONS (all must hold simultaneously):
+  1. Same warp (32 threads)
+  2. Same shared memory instruction
+  3. DIFFERENT addresses
+  4. Those addresses map to the SAME bank
+
+bank = flat_index % 32
+flat_index = row * stride + col  (for 2D array)
+
+CONFLICT DEGREE FOR UNIFORM STRIDE:
+  degree = gcd(stride, 32)
+  stride 1  -> degree 1  -> no conflict
+  stride 2  -> degree 2  -> 2-way
+  stride 4  -> degree 4  -> 4-way
+  stride 8  -> degree 8  -> 8-way
+  stride 16 -> degree 16 -> 16-way
+  stride 32 -> degree 32 -> 32-way (worst)
+  stride 3  -> degree 1  -> no conflict  (odd stride is safe)
+  stride 5  -> degree 1  -> no conflict
+
+  NOTE: the formula applies to uniform stride. 2D warp layouts
+  (multi-row warps) can cause conflicts that bypass this formula.
+
+HOW TO FIX:
+
+  Method 1 -- Add +1 padding:
+    sh[ROW][COL+1] instead of sh[ROW][COL]
+    Stride changes from COL to COL+1 (often odd -> safe)
+    Drawback: extra memory; can cause new 2D conflicts (see Error 1)
+
+  Method 2 -- XOR swizzle:
+    Write: sh[ty][tx ^ ty]
+    Read:  sh[ty][k ^ ty]
+    No extra memory. Zero conflicts.
+    Requires matching de-swizzle on every read.
+
+  Method 3 -- Transpose before loading:
+    Load A transposed into shared memory so compute reads across rows.
+    Requires restructuring the algorithm.
+
+  Method 4 -- Restructure access pattern:
+    Ensure all warp threads access consecutive columns (stride 1).
+
+BROADCAST (SPECIAL CASE -- NO CONFLICT):
+  Multiple threads read the SAME address -> hardware multicasts.
+  Condition 3 (different addresses) is violated -> no serialization.
+  Example: all threads reading sh_a[ty][k] where ty and k are the same
+  for all threads in a sub-warp.
+
+================================================================================
+  END OF FILE
+================================================================================
