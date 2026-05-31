@@ -1,0 +1,2934 @@
+================================================================================
+  CUDA BATCHED MATRIX MULTIPLICATION -- FULL STUDY NOTES
+  File: batchedMatrixMultiplicationV0_v0.txt
+  Source: batchedMatrixMultiplicationV0.cu
+================================================================================
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  Section | Topic
+  --------+----------------------------------------------------------------------
+   0      | Full source code
+   1      | Overview -- what batched matmul computes, C[b] = A[b] x B[b]
+   2      | Memory layout -- flat 1D array, batch-first row-major order,
+           |   access formula, concrete index trace
+   3      | Grid and block configuration -- 3D grid mapping, blockIdx.z = batch,
+           |   example with 4 blocks
+   4      | Thread -> output element mapping -- ASCII diagram, concrete
+           |   thread-to-C[b][row][col] trace
+   5      | Tile loop -- how N is split into strips, diagram for M=4, N=8
+   6      | Loading TILE_A -- what a_col does, full 16-thread load trace,
+           |   coalesced access explanation
+   7      | Loading TILE_B -- what b_row does, full load trace,
+           |   coalesced access explanation
+   8      | Why tx controls A's column and ty controls B's row --
+           |   coalescing design rationale, summary table
+   9      | Dot product inner loop -- formula expanded, shared memory
+           |   access pattern
+  10      | Two __syncthreads() calls -- what each barrier protects,
+           |   timeline diagram
+  11      | Boundary checks -- partial tile and partial dimension handling,
+           |   0.0f padding
+  12      | Write-back formula -- flat index derivation, concrete numeric example
+  13      | Full numeric trace -- M=4, N=8, K=4, thread (ty=1,tx=2),
+           |   both tile iterations, final acc verified
+  14      | End-to-end production summary -- M=8192, N=6144, K=4096 scale numbers
+  15      | CPU reference code explanation
+  16      | Summary table of all key variables
+================================================================
+  17-23   | Q2: Is TILE_SIZE always equal to block size?
+           |   -- Why equal in this code, what breaks if blockDim < TILE_SIZE,
+           |      what breaks if blockDim > TILE_SIZE, concrete bug scenarios,
+           |      loop-fix for large tiles (TILE_SIZE=64 with 32x32 block),
+           |      hardware 1024-thread limit, general rule table
+================================================================
+Part 3:    |
+ 
+Q20        |      more FMADs visible at once → compiler can interleave them for better ILP, but uses more instruction cache.
+what is FMAD, ILP
+
+Q21        |      Occupancy vs ILP 
+
+Q22        |      A practical example of trading Occupancy for ILP (with code before/after)? 
+
+Q23        |      How to measure ILP in Nsight Compute 
+
+Q24        |      How to correlate ILP with Roofline chart? 
+
+Q25        |      A real Nsight Compute Roofline screenshot description (with numbers)? 
+
+Q26        |.     How to improve a specific kernel’s position on the Roofline using ILP? 
+================================================================
+
+
+QUESTIONS COVERED
+-----------------
+Q1. Please explain this code in details, using examples:
+    batchedMatrixMultiplicationV0.cu
+
+Q2. Is it always true that TILE_SIZE == block_size?
+    Here TILE_SIZE=32, blockSize=(32,32)=1024 threads.
+    Please use detailed examples to explain.
+
+================================================================================
+  PART 0 -- FULL SOURCE CODE
+================================================================================
+
+#include <cuda_runtime.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <iomanip>
+
+#define TILE_SIZE 32
+
+// -----------------------------------------------------------------------------
+// GPU Kernels
+// -----------------------------------------------------------------------------
+
+__global__ void matmul_kernel(const float* A, const float* B, float* C,
+                               int batch, int m, int n, int k) {
+    int col    = threadIdx.x + blockDim.x * blockIdx.x;
+    int row    = threadIdx.y + blockDim.y * blockIdx.y;
+    int matrix = blockIdx.z;
+
+    __shared__ float TILE_A[TILE_SIZE][TILE_SIZE];
+    __shared__ float TILE_B[TILE_SIZE][TILE_SIZE];
+
+    float acc = 0.0f;
+    for (int tilestart = 0; tilestart < n; tilestart += TILE_SIZE) {
+        int a_col = tilestart + threadIdx.x;
+        int b_row = tilestart + threadIdx.y;
+
+        if (row < m && a_col < n)
+            TILE_A[threadIdx.y][threadIdx.x] = A[matrix * m * n + row * n + a_col];
+        else
+            TILE_A[threadIdx.y][threadIdx.x] = 0.0f;
+
+        if (b_row < n && col < k)
+            TILE_B[threadIdx.y][threadIdx.x] = B[matrix * n * k + b_row * k + col];
+        else
+            TILE_B[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int ti = 0; ti < TILE_SIZE; ti++) {
+            acc += TILE_A[threadIdx.y][ti] * TILE_B[ti][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < m && col < k)
+        C[matrix * m * k + row * k + col] = acc;
+}
+
+extern "C" void solve(const float* A, const float* B, float* C,
+                      int BATCH, int M, int N, int K) {
+    dim3 blockSize(TILE_SIZE, TILE_SIZE);
+    dim3 gridSize((K + TILE_SIZE - 1) / TILE_SIZE,
+                  (M + TILE_SIZE - 1) / TILE_SIZE,
+                  BATCH);
+    matmul_kernel<<<gridSize, blockSize>>>(A, B, C, BATCH, M, N, K);
+}
+
+// -----------------------------------------------------------------------------
+// CPU Reference
+// -----------------------------------------------------------------------------
+
+void cpu_matmul(const float* A, const float* B, float* C,
+                int batch, int m, int n, int k) {
+    for (int b = 0; b < batch; ++b)
+        for (int i = 0; i < m; ++i)
+            for (int j = 0; j < k; ++j) {
+                float sum = 0.0f;
+                for (int l = 0; l < n; ++l)
+                    sum += A[b*m*n + i*n + l] * B[b*n*k + l*k + j];
+                C[b*m*k + i*k + j] = sum;
+            }
+}
+
+int main() {
+    const int BATCH = 2;
+    const int M     = 8192;
+    const int N     = 6144;
+    const int K     = 4096;
+    const int WARMUP = 5;
+    const int ITERS  = 20;
+    // ... (allocate, copy, launch, time, cleanup -- see full source)
+}
+
+================================================================================
+  PART 1 -- OVERVIEW
+================================================================================
+
+This kernel computes BATCHED MATRIX MULTIPLICATION:
+
+  For each batch index b = 0, 1, ..., BATCH-1:
+    C[b] = A[b] x B[b]
+
+  A[b] has shape  M x N
+  B[b] has shape  N x K
+  C[b] has shape  M x K
+
+The mathematical definition of one output element:
+
+  C[b][i][j] = SUM over n = 0..N-1 of  A[b][i][n] * B[b][n][j]
+
+Technique used: TILED MATRIX MULTIPLICATION with SHARED MEMORY.
+The shared dimension N is split into strips of width TILE_SIZE=32.
+Each strip is loaded into shared memory once and reused by all threads
+in the block, reducing expensive global memory reads.
+
+================================================================================
+  PART 2 -- MEMORY LAYOUT: HOW 3D DATA IS STORED AS A 1D FLAT ARRAY
+================================================================================
+
+All three arrays A, B, C are passed as flat 1D float pointers.
+They are stored in ROW-MAJOR, BATCH-FIRST order.
+
+  A  has logical shape  BATCH x M x N
+  B  has logical shape  BATCH x N x K
+  C  has logical shape  BATCH x M x K
+
+Element access formulas:
+
+  A[b][i][j]  ->  A_flat[ b * M * N  +  i * N  +  j ]
+  B[b][i][j]  ->  B_flat[ b * N * K  +  i * K  +  j ]
+  C[b][i][j]  ->  C_flat[ b * M * K  +  i * K  +  j ]
+
+Concrete example: BATCH=2, M=4, N=4, K=4
+
+  A in memory (flat, total 2*4*4 = 32 floats):
+
+  Index: 0    1    2    3    4    5    6    7    8  ...  15   16  ...  31
+         A[0][0][0]             A[0][0][3]         A[0][3][3]  A[1][0][0]
+         |<-------- batch 0, row 0 ------->|       |           |
+                                           batch 0, all rows   batch 1 starts
+
+  Laid out as:
+    [A[0][0][0], A[0][0][1], A[0][0][2], A[0][0][3],   <- b=0, row=0
+     A[0][1][0], A[0][1][1], A[0][1][2], A[0][1][3],   <- b=0, row=1
+     A[0][2][0], A[0][2][1], A[0][2][2], A[0][2][3],   <- b=0, row=2
+     A[0][3][0], A[0][3][1], A[0][3][2], A[0][3][3],   <- b=0, row=3
+     A[1][0][0], A[1][0][1], A[1][0][2], A[1][0][3],   <- b=1, row=0
+     A[1][1][0], A[1][1][1], A[1][1][2], A[1][1][3],   <- b=1, row=1
+     A[1][2][0], A[1][2][1], A[1][2][2], A[1][2][3],   <- b=1, row=2
+     A[1][3][0], A[1][3][1], A[1][3][2], A[1][3][3]]   <- b=1, row=3
+
+  To access A[batch=1][row=2][col=3]:
+    flat index = 1*4*4 + 2*4 + 3 = 16 + 8 + 3 = 27
+
+  Verify: A_flat[27] = A[1][2][3]  (row 2, col 3 of batch 1's A matrix)
+
+  Same logic applies to B and C, with different strides.
+
+================================================================================
+  PART 3 -- GRID AND BLOCK CONFIGURATION
+================================================================================
+
+  dim3 blockSize(TILE_SIZE, TILE_SIZE);        // (32, 32) = 1024 threads/block
+  dim3 gridSize(
+      (K + TILE_SIZE - 1) / TILE_SIZE,         // X: ceil(K/32) blocks
+      (M + TILE_SIZE - 1) / TILE_SIZE,         // Y: ceil(M/32) blocks
+      BATCH                                     // Z: one layer per batch item
+  );
+
+THE 3D GRID MAPS TO THE OUTPUT TENSOR C:
+
+  blockIdx.z  ->  which batch item (0..BATCH-1)
+  blockIdx.y  ->  which 32-row tile  of C[b]
+  blockIdx.x  ->  which 32-col tile  of C[b]
+
+Example: M=64, N=48, K=32, TILE_SIZE=32, BATCH=2
+
+  gridSize = ( ceil(32/32), ceil(64/32), 2 ) = (1, 2, 2)
+  Total blocks = 1 * 2 * 2 = 4
+
+  Block (bx=0, by=0, bz=0) -> C[batch=0][rows  0..31][cols 0..31]
+  Block (bx=0, by=1, bz=0) -> C[batch=0][rows 32..63][cols 0..31]
+  Block (bx=0, by=0, bz=1) -> C[batch=1][rows  0..31][cols 0..31]
+  Block (bx=0, by=1, bz=1) -> C[batch=1][rows 32..63][cols 0..31]
+
+ASCII -- how blocks tile the C[b=0] matrix (M=64, K=32):
+
+        col: 0          31
+  row 0:  [  block(bx=0,by=0,bz=0)  ]
+  ...     [                         ]
+  row 31: [                         ]
+  row 32: [  block(bx=0,by=1,bz=0)  ]
+  ...     [                         ]
+  row 63: [                         ]
+
+  (For batch=1, same tiling but bz=1.)
+
+================================================================================
+  PART 4 -- THREAD -> OUTPUT ELEMENT MAPPING
+================================================================================
+
+Inside the kernel:
+
+  int col    = threadIdx.x + blockDim.x * blockIdx.x;   // output col of C[b]
+  int row    = threadIdx.y + blockDim.y * blockIdx.y;   // output row of C[b]
+  int matrix = blockIdx.z;                               // batch index
+
+Each thread computes exactly ONE output element: C[matrix][row][col].
+
+Example: TILE_SIZE=4, block (bx=1, by=0, bz=0):
+
+  Thread (tx=0,ty=0): col=4, row=0, matrix=0  ->  C[0][0][4]
+  Thread (tx=1,ty=0): col=5, row=0, matrix=0  ->  C[0][0][5]
+  Thread (tx=2,ty=0): col=6, row=0, matrix=0  ->  C[0][0][6]
+  Thread (tx=3,ty=0): col=7, row=0, matrix=0  ->  C[0][0][7]
+  Thread (tx=0,ty=1): col=4, row=1, matrix=0  ->  C[0][1][4]
+  Thread (tx=1,ty=1): col=5, row=1, matrix=0  ->  C[0][1][5]
+  Thread (tx=2,ty=1): col=6, row=1, matrix=0  ->  C[0][1][6]
+  Thread (tx=3,ty=1): col=7, row=1, matrix=0  ->  C[0][1][7]
+  Thread (tx=0,ty=2): col=4, row=2, matrix=0  ->  C[0][2][4]
+  ...
+  Thread (tx=3,ty=3): col=7, row=3, matrix=0  ->  C[0][3][7]
+
+ASCII -- which C[b=0] element each thread in block(bx=1,by=0) owns:
+
+       col: 0  1  2  3 | 4  5  6  7
+  row=0:  [bx=0 owns ][tx0 tx1 tx2 tx3]  <- ty=0
+  row=1:  [bx=0 owns ][tx0 tx1 tx2 tx3]  <- ty=1
+  row=2:  [bx=0 owns ][tx0 tx1 tx2 tx3]  <- ty=2
+  row=3:  [bx=0 owns ][tx0 tx1 tx2 tx3]  <- ty=3
+
+================================================================================
+  PART 5 -- TILE LOOP: HOW THE SHARED DIMENSION N IS PROCESSED
+================================================================================
+
+C[b][row][col] = SUM over n=0..N-1 of A[b][row][n] * B[b][n][col]
+
+N can be very large (e.g. 6144). The sum is split into tiles of width TILE_SIZE:
+
+  Tile 0: n = 0         .. TILE_SIZE-1
+  Tile 1: n = TILE_SIZE .. 2*TILE_SIZE-1
+  Tile 2: n = 2*TILE_SIZE .. 3*TILE_SIZE-1
+  ...
+  Last:   n = floor(N/TILE_SIZE)*TILE_SIZE .. N-1  (may be a partial tile)
+
+Each tile iteration:
+  1. Load TILE_SIZE columns of A[b][row][*]  into TILE_A (all threads collaborate)
+  2. Load TILE_SIZE rows    of B[b][*][col]  into TILE_B (all threads collaborate)
+  3. __syncthreads()   -- wait for all loads to complete
+  4. Accumulate partial dot product from TILE_A and TILE_B
+  5. __syncthreads()   -- wait before overwriting tiles in next iteration
+
+Diagram (M=4, N=8, K=4, TILE_SIZE=4):
+
+  A[0] (4x8):
+   n:  0 1 2 3 | 4 5 6 7
+  r0: [. . . . | . . . .]
+  r1: [. . . . | . . . .]
+  r2: [. . . . | . . . .]
+  r3: [. . . . | . . . .]
+       \tile0 / \tile1 /
+
+  B[0] (8x4):
+   row: col0 col1 col2 col3
+   n0: [ .    .    .    . ]   \
+   n1: [ .    .    .    . ]    tile 0 (rows 0..3)
+   n2: [ .    .    .    . ]    of B
+   n3: [ .    .    .    . ]   /
+   n4: [ .    .    .    . ]   \
+   n5: [ .    .    .    . ]    tile 1 (rows 4..7)
+   n6: [ .    .    .    . ]    of B
+   n7: [ .    .    .    . ]   /
+
+  Total iterations = N / TILE_SIZE = 8 / 4 = 2
+
+TILE LOOP CODE:
+
+  for (int tilestart = 0; tilestart < n; tilestart += TILE_SIZE) {
+      int a_col = tilestart + threadIdx.x;
+      int b_row = tilestart + threadIdx.y;
+
+      // Load A tile
+      if (row < m && a_col < n)
+          TILE_A[threadIdx.y][threadIdx.x] = A[matrix * m * n + row * n + a_col];
+      else
+          TILE_A[threadIdx.y][threadIdx.x] = 0.0f;
+
+      // Load B tile
+      if (b_row < n && col < k)
+          TILE_B[threadIdx.y][threadIdx.x] = B[matrix * n * k + b_row * k + col];
+      else
+          TILE_B[threadIdx.y][threadIdx.x] = 0.0f;
+
+      __syncthreads();
+
+      for (int ti = 0; ti < TILE_SIZE; ti++)
+          acc += TILE_A[threadIdx.y][ti] * TILE_B[ti][threadIdx.x];
+
+      __syncthreads();
+  }
+
+================================================================================
+  PART 6 -- LOADING TILE_A: WHAT a_col DOES
+================================================================================
+
+  int a_col = tilestart + threadIdx.x;
+
+a_col is the GLOBAL COLUMN INDEX in matrix A that this thread loads.
+
+For tile 0 (tilestart=0): a_col = threadIdx.x = 0..31
+For tile 1 (tilestart=32): a_col = 32..63
+For tile t: a_col = t*32 .. t*32+31
+
+Thread (ty, tx) loads:
+  TILE_A[ty][tx] = A[ matrix * m * n  +  row * n  +  a_col ]
+                 = A[ matrix * m * n  +  (by*TILE+ty) * n  +  (tilestart+tx) ]
+
+So TILE_A[local_row][local_col] = A[b][ global_row ][ tilestart + local_col ]
+
+After loading, TILE_A contains a TILE_SIZE x TILE_SIZE submatrix of A[b]:
+  rows:    block's rows  (by*TILE .. by*TILE+TILE-1)
+  columns: this tile's columns  (tilestart .. tilestart+TILE-1)
+
+Concrete example: TILE_SIZE=4, batch=0, block by=1, tile 0 (tilestart=0), M=8, N=8:
+
+  Thread (ty=0,tx=0): row=4, a_col=0  ->  TILE_A[0][0] = A[0][4][0]
+  Thread (ty=0,tx=1): row=4, a_col=1  ->  TILE_A[0][1] = A[0][4][1]
+  Thread (ty=0,tx=2): row=4, a_col=2  ->  TILE_A[0][2] = A[0][4][2]
+  Thread (ty=0,tx=3): row=4, a_col=3  ->  TILE_A[0][3] = A[0][4][3]
+  Thread (ty=1,tx=0): row=5, a_col=0  ->  TILE_A[1][0] = A[0][5][0]
+  Thread (ty=1,tx=1): row=5, a_col=1  ->  TILE_A[1][1] = A[0][5][1]
+  ...
+  Thread (ty=3,tx=3): row=7, a_col=3  ->  TILE_A[3][3] = A[0][7][3]
+
+  TILE_A after loading (tile 0):
+    [A[0][4][0]  A[0][4][1]  A[0][4][2]  A[0][4][3]]   <- local row 0 = global row 4
+    [A[0][5][0]  A[0][5][1]  A[0][5][2]  A[0][5][3]]   <- local row 1 = global row 5
+    [A[0][6][0]  A[0][6][1]  A[0][6][2]  A[0][6][3]]   <- local row 2 = global row 6
+    [A[0][7][0]  A[0][7][1]  A[0][7][2]  A[0][7][3]]   <- local row 3 = global row 7
+
+COALESCED MEMORY ACCESS FOR A:
+  Threads in the same warp have same ty but consecutive tx (0..31).
+  A's flat index = matrix*m*n + row*n + (tilestart + tx)
+  As tx increases by 1, the flat index increases by 1.
+  -> Consecutive threads access consecutive memory addresses.
+  -> Hardware combines into one wide memory transaction. (Coalesced!)
+
+================================================================================
+  PART 7 -- LOADING TILE_B: WHAT b_row DOES
+================================================================================
+
+  int b_row = tilestart + threadIdx.y;
+
+b_row is the GLOBAL ROW INDEX in matrix B that this thread loads.
+
+For tile 0 (tilestart=0): b_row = threadIdx.y = 0..31
+For tile 1 (tilestart=32): b_row = 32..63
+For tile t: b_row = t*32 .. t*32+31
+
+Thread (ty, tx) loads:
+  TILE_B[ty][tx] = B[ matrix * n * k  +  b_row * k  +  col ]
+                 = B[ matrix * n * k  +  (tilestart+ty) * k  +  (bx*TILE+tx) ]
+
+So TILE_B[local_row][local_col] = B[b][ tilestart + local_row ][ global_col ]
+
+After loading, TILE_B contains a TILE_SIZE x TILE_SIZE submatrix of B[b]:
+  rows:    this tile's rows  (tilestart .. tilestart+TILE-1)
+  columns: block's columns  (bx*TILE .. bx*TILE+TILE-1)
+
+Concrete example: TILE_SIZE=4, batch=0, block bx=0, tile 0 (tilestart=0), N=8, K=4:
+
+  Thread (ty=0,tx=0): b_row=0, col=0  ->  TILE_B[0][0] = B[0][0][0]
+  Thread (ty=0,tx=1): b_row=0, col=1  ->  TILE_B[0][1] = B[0][0][1]
+  Thread (ty=0,tx=2): b_row=0, col=2  ->  TILE_B[0][2] = B[0][0][2]
+  Thread (ty=0,tx=3): b_row=0, col=3  ->  TILE_B[0][3] = B[0][0][3]
+  Thread (ty=1,tx=0): b_row=1, col=0  ->  TILE_B[1][0] = B[0][1][0]
+  Thread (ty=1,tx=1): b_row=1, col=1  ->  TILE_B[1][1] = B[0][1][1]
+  ...
+  Thread (ty=3,tx=3): b_row=3, col=3  ->  TILE_B[3][3] = B[0][3][3]
+
+  TILE_B after loading (tile 0):
+    [B[0][0][0]  B[0][0][1]  B[0][0][2]  B[0][0][3]]   <- n=0, all cols
+    [B[0][1][0]  B[0][1][1]  B[0][1][2]  B[0][1][3]]   <- n=1, all cols
+    [B[0][2][0]  B[0][2][1]  B[0][2][2]  B[0][2][3]]   <- n=2, all cols
+    [B[0][3][0]  B[0][3][1]  B[0][3][2]  B[0][3][3]]   <- n=3, all cols
+
+COALESCED MEMORY ACCESS FOR B:
+  Threads in the same warp have same ty but consecutive tx (0..31).
+  B's flat index = matrix*n*k + b_row*k + (bx*TILE + tx)
+  As tx increases by 1, the flat index increases by 1.
+  -> Consecutive threads access consecutive memory addresses. (Coalesced!)
+
+================================================================================
+  PART 8 -- WHY tx CONTROLS A's COLUMN AND ty CONTROLS B's ROW
+================================================================================
+
+This is a deliberate design decision for COALESCED ACCESS on both A and B.
+
+Rule: In a warp, threadIdx.x varies (0..31) and threadIdx.y is fixed.
+      For coalesced access, the index that changes with threadIdx.x
+      must be the FAST index (the last dimension, i.e. the column).
+
+FOR MATRIX A (shape M x N, row-major):
+  We want to load a tile: one row of A per thread group.
+  The column dimension (N) is the fast dimension.
+  So tx (fast) should control the COLUMN of A -> a_col = tilestart + tx.
+  ty (slow) controls the ROW of A -> row = by*TILE + ty.
+
+FOR MATRIX B (shape N x K, row-major):
+  We want to load a tile: one row of B per thread group.
+  The column dimension (K) is the fast dimension.
+  col = bx*TILE + tx -> tx controls the COLUMN of B. (Fast dimension.)
+  b_row = tilestart + ty -> ty controls the ROW of B. (Slow dimension.)
+
+Summary table:
+
+  Matrix | tx controls      | ty controls      | Coalesced?
+  -------+------------------+------------------+-----------
+  A load | a_col (column)   | row  (fixed/warp)| YES
+  B load | col   (column)   | b_row(fixed/warp)| YES
+
+Without this design (e.g. if ty controlled A's column):
+  tx would be fixed within a warp, ty would vary -> non-consecutive addresses
+  -> Many separate memory transactions -> much slower.
+
+================================================================================
+  PART 9 -- THE DOT PRODUCT INNER LOOP
+================================================================================
+
+  for (int ti = 0; ti < TILE_SIZE; ti++) {
+      acc += TILE_A[threadIdx.y][ti] * TILE_B[ti][threadIdx.x];
+  }
+
+After loading, TILE_A and TILE_B are in shared memory. This loop computes:
+
+  acc += TILE_A[ty][0]*TILE_B[0][tx]
+       + TILE_A[ty][1]*TILE_B[1][tx]
+       + TILE_A[ty][2]*TILE_B[2][tx]
+       + ...
+       + TILE_A[ty][TILE_SIZE-1]*TILE_B[TILE_SIZE-1][tx]
+
+In terms of global matrix values (for tile t, tilestart = t*TILE_SIZE):
+
+  acc += A[b][row][tilestart+0] * B[b][tilestart+0][col]
+       + A[b][row][tilestart+1] * B[b][tilestart+1][col]
+       + ...
+       + A[b][row][tilestart+TILE_SIZE-1] * B[b][tilestart+TILE_SIZE-1][col]
+
+This is the partial dot product for n values in [tilestart .. tilestart+TILE_SIZE-1].
+After all tile iterations, acc = full dot product = C[b][row][col]. Correct.
+
+SHARED MEMORY ACCESS PATTERN:
+  TILE_A[ty][ti]: all threads with the same ty read the same row of TILE_A.
+    As ti varies 0..31, all threads with ty=0 read TILE_A[0][0..31].
+    This is a sequential scan of one row -> no bank conflicts.
+
+  TILE_B[ti][tx]: all threads with the same tx read the same column of TILE_B.
+    But tx varies across the warp -> different columns -> different banks.
+    No bank conflicts.
+
+================================================================================
+  PART 10 -- THE TWO __syncthreads() CALLS
+================================================================================
+
+BARRIER 1 (after loading):
+  // Load TILE_A and TILE_B
+  TILE_A[ty][tx] = A[...];
+  TILE_B[ty][tx] = B[...];
+  __syncthreads();   <-- BARRIER 1
+
+  PURPOSE: All threads must FINISH WRITING to TILE_A and TILE_B before any
+  thread can READ from them in the dot product loop.
+
+  Without this: Thread (ty=0,tx=0) might start computing TILE_A[0][31]
+  before thread (ty=0,tx=31) has written it. Data race -> wrong result.
+
+BARRIER 2 (after computing):
+  for (int ti...) { acc += ...; }
+  __syncthreads();   <-- BARRIER 2
+
+  PURPOSE: All threads must FINISH READING from TILE_A and TILE_B before the
+  next iteration OVERWRITES them with the next tile's data.
+
+  Without this: A fast thread might load tile 1 over TILE_A while a slow
+  thread is still reading tile 0's data. Data race -> wrong result.
+
+Timeline for 2 tile iterations:
+
+  Thread A:  [LOAD tile0] [SYNC1] [COMPUTE tile0] [SYNC2] [LOAD tile1] [SYNC1] [COMPUTE tile1]
+  Thread B:  [LOAD tile0] [SYNC1] [COMPUTE tile0] [SYNC2] [LOAD tile1] [SYNC1] [COMPUTE tile1]
+                          ^                       ^                    ^
+                        barrier                barrier              barrier
+                        (all done loading)   (all done computing)  (all done loading)
+
+  Both SYNC1 and SYNC2 are necessary. Removing either causes a data race.
+
+================================================================================
+  PART 11 -- BOUNDARY CHECKS
+================================================================================
+
+WHILE LOADING A:
+  if (row < m && a_col < n)
+      TILE_A[ty][tx] = A[...];
+  else
+      TILE_A[ty][tx] = 0.0f;
+
+  Case 1 (row >= m): Block by covers rows by*TILE .. by*TILE+TILE-1. If M is
+  not a multiple of TILE_SIZE, the last block has threads with row >= M.
+  Example: M=33, TILE_SIZE=32. Last block (by=1) has ty=0 (row=32, valid)
+  and ty=1..31 (rows 33..63, all >= M=33 -> load 0.0f).
+
+  Case 2 (a_col >= n): Last tile iteration may have tilestart+tx >= N.
+  Example: N=100, TILE_SIZE=32. Last tile: tilestart=96.
+  tx=0..3: a_col=96..99 (valid, < 100)
+  tx=4..31: a_col=100..127 (out of bounds -> load 0.0f)
+
+  Loading 0.0f into out-of-bounds positions ensures those slots contribute
+  zero to the dot product (0 * anything = 0). This pads the tile correctly.
+
+WHILE LOADING B:
+  if (b_row < n && col < k)
+      TILE_B[ty][tx] = B[...];
+  else
+      TILE_B[ty][tx] = 0.0f;
+
+  Same idea: b_row out of N range or col out of K range -> 0.0f padding.
+
+WRITE-BACK CHECK:
+  if (row < m && col < k)
+      C[matrix * m * k + row * k + col] = acc;
+
+  Threads with row >= M or col >= K are silently suppressed. They computed
+  using padded zeros so their acc is meaningless anyway.
+
+================================================================================
+  PART 12 -- GLOBAL MEMORY WRITE-BACK FORMULA
+================================================================================
+
+  C[matrix * m * k + row * k + col] = acc;
+
+  matrix * m * k:  skip past all previous batch items' C matrices
+  row * k:         skip to the correct row within this batch's C
+  col:             column within that row
+
+Concrete example: batch=1, row=3, col=2, M=4, K=4:
+
+  flat index = 1*4*4 + 3*4 + 2
+             = 16 + 12 + 2
+             = 30
+
+  C_flat[30] = C[1][3][2]  (batch 1, row 3, col 2)
+
+================================================================================
+  PART 13 -- FULL CONCRETE NUMERIC TRACE
+================================================================================
+
+Settings: BATCH=2, M=4, N=8, K=4, TILE_SIZE=4, batch index=0
+
+A[0] (4x8):                   B[0] (8x4):
+       n: 0  1  2  3  4  5  6  7        n: col0 col1 col2 col3
+  row0: [a00 a01 a02 a03 a04 a05 a06 a07]  n0: [b00  b01  b02  b03]
+  row1: [a10 a11 a12 a13 a14 a15 a16 a17]  n1: [b10  b11  b12  b13]
+  row2: [a20 a21 a22 a23 a24 a25 a26 a27]  n2: [b20  b21  b22  b23]
+  row3: [a30 a31 a32 a33 a34 a35 a36 a37]  n3: [b30  b31  b32  b33]
+         \---tile0---/  \---tile1---/        n4: [b40  b41  b42  b43]
+                                             n5: [b50  b51  b52  b53]
+                                             n6: [b60  b61  b62  b63]
+                                             n7: [b70  b71  b72  b73]
+                                              \------tile0------/\-tile1-/
+
+Grid: (ceil(4/4), ceil(4/4), 2) = (1, 1, 2)  [only 1 block per batch here]
+Block: (4, 4) = 16 threads
+
+Focus on block (bx=0, by=0, bz=0), thread (ty=1, tx=2):
+  row=1, col=2, matrix=0
+  This thread computes C[0][1][2]
+
+----- TILE ITERATION 0 (tilestart=0) -----
+
+  a_col = 0 + tx = 0 + 2 = 2
+  b_row = 0 + ty = 0 + 1 = 1
+
+  This thread loads:
+    TILE_A[1][2] = A[0*4*8 + 1*8 + 2] = A[0][1][2] = a12
+    TILE_B[1][2] = B[0*8*4 + 1*4 + 2] = B[0][1][2] = b12
+
+  All 16 threads load together. After __syncthreads(), TILE_A and TILE_B hold:
+
+  TILE_A (tile 0 of A, cols 0..3):
+    TILE_A[0][0]=a00  TILE_A[0][1]=a01  TILE_A[0][2]=a02  TILE_A[0][3]=a03
+    TILE_A[1][0]=a10  TILE_A[1][1]=a11  TILE_A[1][2]=a12  TILE_A[1][3]=a13
+    TILE_A[2][0]=a20  TILE_A[2][1]=a21  TILE_A[2][2]=a22  TILE_A[2][3]=a23
+    TILE_A[3][0]=a30  TILE_A[3][1]=a31  TILE_A[3][2]=a32  TILE_A[3][3]=a33
+
+  TILE_B (tile 0 of B, rows 0..3):
+    TILE_B[0][0]=b00  TILE_B[0][1]=b01  TILE_B[0][2]=b02  TILE_B[0][3]=b03
+    TILE_B[1][0]=b10  TILE_B[1][1]=b11  TILE_B[1][2]=b12  TILE_B[1][3]=b13
+    TILE_B[2][0]=b20  TILE_B[2][1]=b21  TILE_B[2][2]=b22  TILE_B[2][3]=b23
+    TILE_B[3][0]=b30  TILE_B[3][1]=b31  TILE_B[3][2]=b32  TILE_B[3][3]=b33
+
+  Dot product for thread (ty=1, tx=2):
+    acc += TILE_A[1][0] * TILE_B[0][2]   = a10 * b02
+         + TILE_A[1][1] * TILE_B[1][2]   = a11 * b12
+         + TILE_A[1][2] * TILE_B[2][2]   = a12 * b22
+         + TILE_A[1][3] * TILE_B[3][2]   = a13 * b32
+
+  acc after tile 0 = a10*b02 + a11*b12 + a12*b22 + a13*b32
+
+----- TILE ITERATION 1 (tilestart=4) -----
+
+  a_col = 4 + tx = 4 + 2 = 6
+  b_row = 4 + ty = 4 + 1 = 5
+
+  This thread loads:
+    TILE_A[1][2] = A[0][1][6] = a16
+    TILE_B[1][2] = B[0][5][2] = b52
+
+  After __syncthreads(), TILE_A and TILE_B now hold tile 1's data:
+
+  TILE_A (tile 1 of A, cols 4..7):
+    TILE_A[0][0]=a04  TILE_A[0][1]=a05  TILE_A[0][2]=a06  TILE_A[0][3]=a07
+    TILE_A[1][0]=a14  TILE_A[1][1]=a15  TILE_A[1][2]=a16  TILE_A[1][3]=a17
+    ...
+
+  TILE_B (tile 1 of B, rows 4..7):
+    TILE_B[0][0]=b40  TILE_B[0][1]=b41  TILE_B[0][2]=b42  TILE_B[0][3]=b43
+    TILE_B[1][0]=b50  TILE_B[1][1]=b51  TILE_B[1][2]=b52  TILE_B[1][3]=b53
+    ...
+
+  Dot product for thread (ty=1, tx=2):
+    acc += TILE_A[1][0] * TILE_B[0][2]   = a14 * b42
+         + TILE_A[1][1] * TILE_B[1][2]   = a15 * b52
+         + TILE_A[1][2] * TILE_B[2][2]   = a16 * b62
+         + TILE_A[1][3] * TILE_B[3][2]   = a17 * b72
+
+----- FINAL ACC -----
+
+  acc = a10*b02 + a11*b12 + a12*b22 + a13*b32   (tile 0)
+      + a14*b42 + a15*b52 + a16*b62 + a17*b72   (tile 1)
+
+      = SUM over n=0..7 of A[0][1][n] * B[0][n][2]
+
+      = C[0][1][2]   CORRECT!
+
+WRITE-BACK:
+  C[0 * 4*4  +  1*4  +  2] = acc
+  C_flat[0 + 4 + 2] = C_flat[6] = C[0][1][2]  CORRECT!
+
+================================================================================
+  PART 14 -- FULL END-TO-END SUMMARY (PRODUCTION SETTINGS)
+================================================================================
+
+Settings: BATCH=2, M=8192, N=6144, K=4096, TILE_SIZE=32
+
+Grid:
+  gridSize.x = ceil(4096/32) = 128    (K direction)
+  gridSize.y = ceil(8192/32) = 256    (M direction)
+  gridSize.z = 2                       (BATCH)
+  Total blocks = 128 * 256 * 2 = 65,536
+
+Block:
+  blockSize = (32, 32) = 1024 threads
+
+Total threads = 65,536 * 1024 = 67,108,864
+
+Tile loop iterations per thread:
+  N / TILE_SIZE = 6144 / 32 = 192 iterations
+
+Per thread work:
+  - 192 iterations of: load 1 float into TILE_A, 1 float into TILE_B,
+    sync, accumulate 32 multiply-adds, sync
+  - Write 1 float to C
+
+Per block work:
+  - Computes 32x32 = 1024 output elements of C[b]
+  - Loads 32*192 = 6144 floats from A[b] (each row of block's tile fully loaded)
+  - Loads 32*192 = 6144 floats from B[b]
+
+Memory savings with tiling:
+  Without tiling: each of 67M threads loads N=6144 floats from A and N=6144
+  from B = 12288 * 67M = ~820 billion float reads (with huge redundancy).
+  With tiling: each block loads its A rows and B columns once into shared mem,
+  then reuses them 32 times (once per dot product step). 32x reduction in
+  global memory traffic per block.
+
+================================================================================
+  PART 15 -- CPU REFERENCE CODE EXPLANATION
+================================================================================
+
+void cpu_matmul(const float* A, const float* B, float* C,
+                int batch, int m, int n, int k) {
+    for (int b = 0; b < batch; ++b)           // loop: each batch item
+        for (int i = 0; i < m; ++i)            // loop: each output row
+            for (int j = 0; j < k; ++j) {      // loop: each output col
+                float sum = 0.0f;
+                for (int l = 0; l < n; ++l)    // loop: dot product
+                    sum += A[b*m*n + i*n + l] * B[b*n*k + l*k + j];
+                C[b*m*k + i*k + j] = sum;
+            }
+}
+
+This is the straightforward O(BATCH * M * N * K) reference.
+With BATCH=2, M=8192, N=6144, K=4096:
+  Operations = 2 * 8192 * 6144 * 4096 = ~411 billion multiply-adds.
+
+The GPU kernel computes the same values but:
+  - Parallelizes across all BATCH * M * K output elements simultaneously
+  - Uses shared memory tiling to reduce global memory traffic by ~32x
+  - Runs thousands of threads in parallel vs. one sequential CPU loop
+
+================================================================================
+  PART 16 -- SUMMARY TABLE: KEY VARIABLES
+================================================================================
+
+  Variable        | Meaning                                 | Formula
+  ----------------+-----------------------------------------+---------------------------
+  matrix          | batch index for this block              | blockIdx.z
+  row             | output row of C[batch]                  | blockIdx.y*32 + threadIdx.y
+  col             | output col of C[batch]                  | blockIdx.x*32 + threadIdx.x
+  tilestart       | start of current tile in N dimension    | 0, 32, 64, ..., N-32
+  a_col           | global col in A to load                 | tilestart + threadIdx.x
+  b_row           | global row in B to load                 | tilestart + threadIdx.y
+  TILE_A[ty][tx]  | loaded A element                        | A[b][row][a_col]
+  TILE_B[ty][tx]  | loaded B element                        | B[b][b_row][col]
+  acc             | running dot product accumulator         | accumulates all tiles
+  Final C write   | store result to global memory           | C[batch*M*K + row*K + col]
+
+================================================================================
+================================================================================
+  PART 17 -- Q2: IS IT ALWAYS TRUE THAT TILE_SIZE == BLOCK_SIZE?
+================================================================================
+================================================================================
+
+QUESTION: The code uses TILE_SIZE=32 and blockSize=(32,32). Is TILE_SIZE
+always equal to blockDim.x and blockDim.y? Why?
+
+SHORT ANSWER: In THIS specific code, YES -- they must be equal. In GENERAL,
+NO -- they can be decoupled, but the code must be changed accordingly.
+
+================================================================================
+  PART 18 -- WHY THEY ARE EQUAL IN THIS CODE
+================================================================================
+
+The kernel uses threadIdx DIRECTLY as the shared memory index:
+
+  TILE_A[threadIdx.y][threadIdx.x] = A[...];
+  TILE_B[threadIdx.y][threadIdx.x] = B[...];
+
+And shared memory is declared as:
+
+  __shared__ float TILE_A[TILE_SIZE][TILE_SIZE];   // [32][32]
+  __shared__ float TILE_B[TILE_SIZE][TILE_SIZE];   // [32][32]
+
+The code assumes:
+  threadIdx.x ranges 0 .. TILE_SIZE-1   ->  blockDim.x = TILE_SIZE
+  threadIdx.y ranges 0 .. TILE_SIZE-1   ->  blockDim.y = TILE_SIZE
+
+This gives a PERFECT 1-TO-1 MAPPING:
+  1 thread loads 1 element of TILE_A
+  1 thread loads 1 element of TILE_B
+
+  Thread (ty,tx) fills TILE_A[ty][tx] and TILE_B[ty][tx]
+  -- exactly one thread per slot, no slot missed, no slot written twice.
+
+  Thread grid (32x32 block):           TILE_A (32x32 shared memory):
+
+  ty=0: [tx0][tx1]...[tx31]            [0][0] [0][1] ... [0][31]
+  ty=1: [tx0][tx1]...[tx31]   -->      [1][0] [1][1] ... [1][31]
+  ...                                   ...
+  ty=31:[tx0][tx1]...[tx31]            [31][0]...      ...[31][31]
+
+  Total: 32*32=1024 threads fill 32*32=1024 slots. Perfect.
+
+================================================================================
+  PART 19 -- WHAT HAPPENS IF blockDim < TILE_SIZE? (BUG SCENARIO)
+================================================================================
+
+Example: TILE_SIZE=32, blockDim=(16,16)
+  threadIdx.x ranges 0..15 (not 0..31!)
+  threadIdx.y ranges 0..15 (not 0..31!)
+
+Loading TILE_A:
+  TILE_A[ty][tx] = A[...] for ty=0..15, tx=0..15
+
+  Thread coverage of shared memory (16x16 threads, 32x32 tile):
+
+    tx: 0..15       tx: 16..31
+  +---------------+--------------+
+  | WRITTEN       | NEVER        |  ty=0..15
+  | (by 16 threads| WRITTEN!     |
+  | in x)         | GARBAGE!     |
+  +---------------+--------------+
+  |                              |  ty=16..31
+  |     NEVER WRITTEN! GARBAGE!  |
+  |                              |
+  +------------------------------+
+
+  16*16 = 256 threads fill only 256 of 1024 slots.
+  768 slots remain uninitialized (garbage values).
+
+The dot product reads all 32 positions:
+  for (int ti = 0; ti < TILE_SIZE; ti++)    // ti = 0..31
+      acc += TILE_A[ty][ti] * TILE_B[ti][tx];
+
+  For ti=16..31: TILE_A[ty][16..31] is garbage -> WRONG RESULTS!
+
+Impact: Silent data corruption. Results look plausible but are numerically
+wrong. Very hard to debug because there's no crash, just bad numbers.
+
+================================================================================
+  PART 20 -- WHAT HAPPENS IF blockDim > TILE_SIZE? (BUG SCENARIO)
+================================================================================
+
+Example: TILE_SIZE=16, blockDim=(32,32)
+  threadIdx.x ranges 0..31 but TILE_A only has 16 columns (0..15)!
+
+Loading TILE_A:
+  TILE_A[threadIdx.y][threadIdx.x] = A[...];
+  For threadIdx.x = 16..31: TILE_A[ty][16] .. TILE_A[ty][31]
+  -> These are OUT OF BOUNDS! TILE_A is only [16][16].
+
+Out-of-bounds shared memory write -> overwrites other variables in shared
+memory or adjacent memory -> memory corruption.
+
+Impact: Undefined behavior. Could corrupt TILE_B, acc, or other shared data.
+Could cause GPU crash, wrong results, or non-deterministic behavior.
+
+================================================================================
+  PART 21 -- CONCRETE EXAMPLE: blockDim=(4,4), TILE_SIZE=4 (Equal -- Works)
+================================================================================
+
+Settings: M=8, N=8, K=8, TILE_SIZE=4, BATCH=1
+
+Grid: ( ceil(8/4), ceil(8/4), 1 ) = (2, 2, 1) = 4 blocks
+Block: (4, 4) = 16 threads
+
+Focus on block (bx=0, by=0, bz=0):
+  This block computes C[0][rows 0..3][cols 0..3]
+
+Thread assignment:
+  (ty=0,tx=0): row=0,col=0  ->  C[0][0][0]
+  (ty=0,tx=1): row=0,col=1  ->  C[0][0][1]
+  (ty=0,tx=2): row=0,col=2  ->  C[0][0][2]
+  (ty=0,tx=3): row=0,col=3  ->  C[0][0][3]
+  (ty=1,tx=0): row=1,col=0  ->  C[0][1][0]
+  (ty=1,tx=1): row=1,col=1  ->  C[0][1][1]
+  ...
+  (ty=3,tx=3): row=3,col=3  ->  C[0][3][3]
+
+Tile iteration 0 (tilestart=0, a_col=tx, b_row=ty):
+
+  (ty=0,tx=0): TILE_A[0][0]=A[0][0][0], TILE_B[0][0]=B[0][0][0]
+  (ty=0,tx=1): TILE_A[0][1]=A[0][0][1], TILE_B[0][1]=B[0][0][1]
+  (ty=0,tx=2): TILE_A[0][2]=A[0][0][2], TILE_B[0][2]=B[0][0][2]
+  (ty=0,tx=3): TILE_A[0][3]=A[0][0][3], TILE_B[0][3]=B[0][0][3]
+  (ty=1,tx=0): TILE_A[1][0]=A[0][1][0], TILE_B[1][0]=B[0][1][0]
+  ...
+  (ty=3,tx=3): TILE_A[3][3]=A[0][3][3], TILE_B[3][3]=B[0][3][3]
+
+  TILE_A = A[0][rows 0..3][cols 0..3]
+  TILE_B = B[0][rows 0..3][cols 0..3]
+
+  4*4 = 16 threads fill 4*4 = 16 slots. Perfect 1:1 coverage.
+
+Dot product for thread (ty=2, tx=1) [computing C[0][2][1]]:
+  acc += TILE_A[2][0]*TILE_B[0][1]  = A[0][2][0]*B[0][0][1]
+       + TILE_A[2][1]*TILE_B[1][1]  = A[0][2][1]*B[0][1][1]
+       + TILE_A[2][2]*TILE_B[2][1]  = A[0][2][2]*B[0][2][1]
+       + TILE_A[2][3]*TILE_B[3][1]  = A[0][2][3]*B[0][3][1]
+
+Tile iteration 1 (tilestart=4, a_col=4+tx, b_row=4+ty):
+
+  Thread (ty=2,tx=1): a_col=5, b_row=6
+  TILE_A[2][1] = A[0][2][5]
+  TILE_B[2][1] = B[0][6][1]
+
+  Dot product adds:
+  acc += TILE_A[2][0]*TILE_B[0][1]  = A[0][2][4]*B[0][4][1]
+       + TILE_A[2][1]*TILE_B[1][1]  = A[0][2][5]*B[0][5][1]
+       + TILE_A[2][2]*TILE_B[2][1]  = A[0][2][6]*B[0][6][1]
+       + TILE_A[2][3]*TILE_B[3][1]  = A[0][2][7]*B[0][7][1]
+
+Final acc = SUM over n=0..7 of A[0][2][n]*B[0][n][1] = C[0][2][1]  CORRECT!
+
+================================================================================
+  PART 22 -- DECOUPLED CASE: TILE_SIZE > blockDim (With Loop Fix)
+================================================================================
+
+If you want TILE_SIZE=64 but are limited to blockDim=(32,32)=1024 threads
+(64*64=4096 would exceed the 1024-thread hardware limit):
+
+  Each thread must load 4096/1024 = 4 elements of TILE_A.
+  Use a FLAT INDEX LOADING LOOP instead of direct [ty][tx] indexing.
+
+Code pattern:
+
+  #define TILE_SIZE 64
+  // blockDim = (32, 32) = 1024 threads
+  __shared__ float TILE_A[TILE_SIZE][TILE_SIZE];  // 64x64 = 4096 elements
+
+  int tid = threadIdx.y * blockDim.x + threadIdx.x;   // flat thread ID: 0..1023
+  int total = TILE_SIZE * TILE_SIZE;                   // 4096 elements to fill
+  int loads_per_thread = total / (blockDim.x * blockDim.y);  // = 4
+
+  for (int i = 0; i < loads_per_thread; i++) {
+      int flat     = tid + i * (blockDim.x * blockDim.y);  // 0,1024,2048,3072
+      int tile_row = flat / TILE_SIZE;                      // 0,16,32,48
+      int tile_col = flat % TILE_SIZE;                      // 0,0,0,0 for tx=0
+      int global_row = blockIdx.y * TILE_SIZE + tile_row;
+      int global_col = tilestart + tile_col;
+      if (global_row < M && global_col < N)
+          TILE_A[tile_row][tile_col] = A[...];
+      else
+          TILE_A[tile_row][tile_col] = 0.0f;
+  }
+
+Trace for tid=5 (ty=0, tx=5), TILE_SIZE=64, blockDim=(32,32):
+
+  i=0: flat=5,    tile_row=5/64=0,  tile_col=5%64=5   -> TILE_A[0][5]
+  i=1: flat=1029, tile_row=1029/64=16, tile_col=1029%64=5 -> TILE_A[16][5]
+  i=2: flat=2053, tile_row=2053/64=32, tile_col=2053%64=5 -> TILE_A[32][5]
+  i=3: flat=3077, tile_row=3077/64=48, tile_col=3077%64=5 -> TILE_A[48][5]
+
+  This thread fills column 5 of rows 0, 16, 32, 48 in TILE_A.
+  All 1024 threads together cover all 4096 positions exactly once.
+
+  tile_col = flat % TILE_SIZE varies with tile_col=tx%TILE_SIZE for i=0
+  -> consecutive threads (tx=0..31) fill consecutive columns -> COALESCED.
+
+================================================================================
+  PART 23 -- SUMMARY: TILE_SIZE VS blockDim RELATIONSHIP
+================================================================================
+
+  Scenario                               | Result
+  ---------------------------------------+---------------------------------------
+  blockDim.x == TILE_SIZE == blockDim.y  | 1 thread per tile slot. Direct [ty][tx]
+                                         | indexing works. THIS CODE.
+  ----------------------------------------+--------------------------------------
+  blockDim.x < TILE_SIZE                 | Tile not fully filled. Garbage values
+                                         | in unwritten slots. WRONG RESULTS.
+  ----------------------------------------+--------------------------------------
+  blockDim.x > TILE_SIZE                 | Out-of-bounds shared memory writes.
+                                         | Memory corruption. UNDEFINED BEHAVIOR.
+  ----------------------------------------+--------------------------------------
+  TILE_SIZE > blockDim, with loop fix    | Each thread loads multiple elements.
+  (e.g. TILE=64, block=(32,32))          | Correct but requires flat-index loop.
+                                         | Used for large tiles that exceed 1024
+                                         | thread limit.
+
+KEY RULE FOR THIS CODE:
+
+  blockDim.x MUST equal TILE_SIZE
+  blockDim.y MUST equal TILE_SIZE
+
+  Because:
+    TILE_A[threadIdx.y][threadIdx.x] requires threadIdx.x in [0, TILE_SIZE)
+    and threadIdx.y in [0, TILE_SIZE).
+    This is only guaranteed when blockDim.x == TILE_SIZE and blockDim.y == TILE_SIZE.
+
+GENERAL RULE:
+
+  threads_per_block * elements_loaded_per_thread = TILE_SIZE * TILE_SIZE
+
+  When blockDim.x * blockDim.y == TILE_SIZE^2 -> each thread loads 1 element.
+  When blockDim.x * blockDim.y < TILE_SIZE^2 -> each thread loads multiple elements.
+  When blockDim.x * blockDim.y > TILE_SIZE^2 -> some threads load 0 (waste) or overflow.
+
+HARDWARE LIMIT:
+  Modern NVIDIA GPUs support at most 1024 threads per block.
+  TILE_SIZE=32: 32*32 = 1024 = limit (barely fits!)
+  TILE_SIZE=64: 64*64 = 4096 > 1024 -> CANNOT use 64x64 block.
+                Must use smaller block (e.g. 32x32) with 4 loads per thread.
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
+
+
+================================================================
+================================================================
+PART II: batchedMatrixMultiplicationV1.cu
+Hierarchical Tiled SGEMM with Double Buffering and Vectorized Loads
+================================================================
+================================================================
+
+================================================================
+TABLE OF CONTENTS — PART II
+================================================================
+Q1.  Full Code Explanation ..................................... Overall architecture, 3 kernels, dispatch logic
+Q2.  Where Do BM, BN, BK, WM, WN, WK, TM, TN, TK Come From?  Programmer-chosen vs hardware parameters
+Q3.  Physical Meaning of Each Tile Parameter ................... What each B/W/T dimension controls
+Q4.  Why tArA Is Sized WK*TM, Not TK*TM ....................... Pre-loading vs step-size distinction
+Q5.  The mma Formula: Why tArA[_k*TM+m] Not tArA[m*TM+_k]?... Transpose in register layout
+Q6.  local_tile Macro ........................................... Pointer to tile [row][col] in a tiled matrix
+Q7.  get_offset Macro ........................................... Vectorized element pointer with type cast
+Q8.  load_Global_To_Shared ...................................... Vectorized load with optional transpose
+Q9.  load_Shared_To_Reg .......................................... Shared memory to register loading
+Q10. Why Mix WM, WN, TM, TN in load_Shared_To_Reg? ............ Two-level navigation explained
+Q11. Bank Conflict: Option 1 (stride=4) vs Option 2 (stride=8)  Why interleaved pattern avoids conflicts
+Q12. What Are the Other 24 Threads Doing During A Load? ........ Broadcast pattern across 32 lanes
+Q13. B Loading: Lane Groups and Addresses ...................... tn_vec_id groups and sB addresses
+Q14. Why All 32 Threads Need Their Own Register Copy ........... Private registers, different outputs
+Q15. lane_id vs thread_id ...................................... They are NOT the same thing
+Q16. Bank Conflicts With All 32 Threads in the Warp ............ Broadcast vs conflict rules
+Q17. store_Reg_To_Global ........................................ Writing tCrC back to global C
+Q18. Why Transpose A, Not B? ................................... Column access vs row access analysis
+Q19. Why WK Not TK in the mma Outer Loop? ...................... Total work vs step size distinction
+================================================================
+
+
+================================================================
+Q1. FULL CODE EXPLANATION: batchedMatrixMultiplicationV1.cu
+================================================================
+
+PROBLEM
+-------
+Batched matrix multiply: for each batch b, compute C[b] = A[b] * B[b]
+  A: M x K
+  B: K x N
+  C: M x N
+
+THREE KERNELS, THREE LEVELS OF OPTIMIZATION
+--------------------------------------------
+
+Kernel 1: sgemm_Kernel_Naive
+  - Used as fallback for small or unaligned inputs
+  - 1 thread computes 1 output element
+  - No shared memory, no tiling
+
+Kernel 2: sgemm_Kernel_Universal_Pipeline_TT
+  - Full hierarchical tiling + double buffering
+  - Runtime M, N, K (general case)
+
+Kernel 3: sgemm_Kernel_Universal_Pipeline_TT_Specialized
+  - Same algorithm as Kernel 2
+  - M, N, K are compile-time template parameters (M=8192, N=6144, K=4096)
+  - Enables more aggressive compiler optimization (constant folding, no branches)
+
+DISPATCH LOGIC IN solve()
+--------------------------
+
+if (M==8192 and N==6144 and K==4096):
+    launch_Pipeline_Specialized()          <- compile-time dims, fastest
+
+else if (is_aligned(A,16) and is_aligned(B,16) and is_aligned(C,16)
+         and M%8==0 and N%8==0 and K%8==0
+         and M>=BM and N>=BN and K%BK==0):
+    launch_Pipeline()                       <- runtime dims, full pipeline
+
+else:
+    launch_Naive()                          <- fallback
+
+KEY PARAMETERS (from solve()):
+  BM=256, BN=128, BK=16       <- Block (CTA) tile
+  WM=64,  WN=32,  WK=8        <- Warp tile
+  TM=8,   TN=8,   TK=1        <- Thread tile
+  block_size = (32, 16) = 512 threads
+  vec_t = uint4 (loads 4 floats = 16 bytes per instruction)
+
+
+NAIVE KERNEL
+------------
+
+  __global__ void sgemm_Kernel_Naive(const float* A, const float* B, float* C,
+                                      int M, int N, int K):
+    int col = blockIdx.x * blockDim.x + threadIdx.x
+    int row = blockIdx.y * blockDim.y + threadIdx.y
+    int batch_id = blockIdx.z
+
+    A += batch_id * M * K     <- advance pointer to this batch's A
+    B += batch_id * N * K     <- advance pointer to this batch's B
+    C += batch_id * M * N     <- advance pointer to this batch's C
+
+    if (row < M and col < N):
+      rC = 0
+      for k in 0..K-1:
+        rC += A[row*K + k] * B[k*N + col]
+      C[row*N + col] = rC
+
+  Key: pointer advance once per kernel, not inside every array index.
+  A is M x K, B is K x N, C is M x N.
+
+
+SHARED MEMORY LAYOUT (double-buffered)
+---------------------------------------
+
+  extern float smem[]
+  float* sA[2] = {smem, smem + BK*BM}
+  float* sB[2] = {smem + 2*BK*BM, smem + 2*BK*BM + BK*BN}
+
+  Layout:
+  +----------+----------+----------+----------+
+  |  sA[0]   |  sA[1]   |  sB[0]   |  sB[1]   |
+  | BK*BM    | BK*BM    | BK*BN    | BK*BN    |
+  | 16*256   | 16*256   | 16*128   | 16*128   |
+  | =4096 f  | =4096 f  | =2048 f  | =2048 f  |
+  +----------+----------+----------+----------+
+  Total = 2*16*(256+128) = 12288 floats = 49152 bytes
+
+  NOTE: sA is stored TRANSPOSED as [BK][BM] = [16][256].
+        A original is M x K, so A tile is [BM][BK] = [256][16].
+        Transposing makes shared memory reads sequential during the inner loop.
+
+
+DOUBLE BUFFERING FLOW
+---------------------
+
+  curr = 0
+
+  Load tile 0 into sA[0], sB[0]
+  __syncthreads()
+
+  for bkid = 0 to K/BK - 2:
+    next = 1 ^ curr
+    Load tile (bkid+1) into sA[next], sB[next]   <- prefetch next tile
+    Compute tile bkid using sA[curr], sB[curr]    <- work on current tile
+    __syncthreads()
+    curr ^= 1                                       <- swap buffers
+
+  Compute last tile using sA[curr], sB[curr]
+
+  Timeline (K=48, BK=16, 3 tiles):
+    iter bkid=0: load tile1 | compute tile0
+    iter bkid=1: load tile2 | compute tile1
+    final:                    compute tile2
+
+  Overlaps DRAM loading with computation, hides memory latency.
+
+
+DATA FLOW SUMMARY
+-----------------
+
+  Global A[b][M][K]
+      |  transposed load (uint4, 4 floats at once)
+      v
+  sA[2][BK][BM]        <- k-major layout for sequential shared memory access
+      |  warp tile select + vec load
+      v
+  tArA[WK][TM]         <- private registers, k-major, 64 floats per thread
+      |
+      +---- mma (outer product accumulate) ---->  tCrC[TM][TN] in registers
+      |
+  tBrB[WK][TN]         <- private registers, k-major, 64 floats per thread
+      ^
+      |  warp tile select + vec load
+      |
+  sB[2][BK][BN]        <- k-major layout (not transposed, B row access is natural)
+      ^
+      |  direct load (uint4, no transpose)
+      |
+  Global B[b][K][N]
+
+  tCrC[TM][TN] -> vectorized stores -> Global C[b][M][N]
+
+
+================================================================
+Q2. WHERE DO BM, BN, BK, WM, WN, WK, TM, TN, TK COME FROM?
+================================================================
+
+ANSWER: PROGRAMMER-CHOSEN, NOT HARDWARE PARAMETERS
+
+They are defined as constexpr in solve():
+
+  constexpr int BM = 256;
+  constexpr int BN = 128;
+  constexpr int BK = 16;
+  constexpr int WM = 64;
+  constexpr int WN = 32;
+  constexpr int WK = 8;
+  constexpr int TM = 8;
+  constexpr int TN = 8;
+  constexpr int TK = 1;
+
+The programmer picks these by empirical tuning: try different combinations,
+profile on the target GPU, keep the fastest combination.
+
+THE ONE TRUE HARDWARE PARAMETER IN THE CODE
+--------------------------------------------
+Warp size = 32 threads. This is a hardware constant baked into every NVIDIA GPU.
+
+  warp_id = tid >> 5      <- divide by 32
+  lane_id = tid & 0x1F    <- mod 32
+
+HARDWARE CONSTRAINTS THE TILE CHOICES MUST RESPECT
+----------------------------------------------------
+
+  Hardware limit                Tile choice must satisfy
+  ─────────────────             ─────────────────────────
+  Warp size = 32                warp_id = tid >> 5  (hardcoded 32)
+  Max threads per block = 1024  BM/WM * BN/WN * 32 = 4*4*32 = 512 <= 1024
+  Shared mem per block <= 96KB  2*BK*(BM+BN)*4 = 49152 bytes (needs carveout)
+  uint4 requires 16-byte align  is_aligned(A,16) guard in dispatch
+  Max ~255 registers/thread     tArA(64) + tBrB(64) + tCrC(64) = 192 regs
+
+WHY THESE SPECIFIC VALUES?
+--------------------------
+  BM=256, BN=128  large output tile -> amortize A and B loading over more outputs
+  BK=16           small K-tile -> shared memory stays small, fits in L1
+  WM=64, WN=32    each warp owns 64*32=2048 outputs -> high register reuse
+  TM=8, TN=8      each thread computes 64 values -> minimize per-element overhead
+  TK=1            innermost step size; 1 = compiler has maximum scheduling freedom
+
+
+================================================================
+Q3. PHYSICAL MEANING OF EACH TILE PARAMETER
+================================================================
+
+THE M, N, K DIMENSIONS
+-----------------------
+  A: M rows x K cols
+  B: K rows x N cols
+  C: M rows x N cols
+
+  C[i][j] = sum over k: A[i][k] * B[k][j]
+
+  M = output rows (rows of C and A)
+  N = output cols (cols of C and B)
+  K = inner/shared dimension (summed away, not in C)
+
+PREFIX MEANINGS
+---------------
+  B = Block (CTA)  - one SM runs one block
+  W = Warp         - 32 threads executing together
+  T = Thread       - one single CUDA thread
+
+BM, BN: OUTPUT TILE THAT ONE BLOCK COMPUTES
+--------------------------------------------
+  BM=256, BN=128
+  One block computes 256 x 128 = 32768 elements of C.
+
+  Full C (8192 x 6144), blocked into BM x BN tiles:
+  Each block computes one tile.
+  Total blocks = ceil(8192/256) * ceil(6144/128) = 32 * 48 = 1536 (per batch)
+
+  Each block loads:
+    A slice: BM rows x K cols = 256 x 4096 elements
+    B slice: K rows x BN cols = 4096 x 128 elements
+
+BK: HOW MUCH OF K THE BLOCK LOADS PER OUTER LOOP STEP
+------------------------------------------------------
+  BK=16
+  The block loops over K in steps of 16:
+    Outer loop iterations = K / BK = 4096 / 16 = 256 iterations
+  Each iteration:
+    Load A tile [BM x BK] = [256 x 16] into shared memory
+    Load B tile [BK x BN] = [16 x 128] into shared memory
+    Compute partial dot products using those 16 K-values
+
+WM, WN: OUTPUT TILE THAT ONE WARP COMPUTES (inside block's tile)
+-----------------------------------------------------------------
+  WM=64, WN=32
+  The block's 256 x 128 tile is divided among 16 warps, each owning 64 x 32.
+
+  Block tile (256 x 128):
+  +─────────+─────────+─────────+─────────+
+  |warp[0,0]|warp[0,1]|warp[0,2]|warp[0,3]|  <- WN=32 wide each
+  |  64x32  |  64x32  |  64x32  |  64x32  |
+  +─────────+─────────+─────────+─────────+
+  |warp[1,0]|warp[1,1]|warp[1,2]|warp[1,3]|
+  +─────────+─────────+─────────+─────────+
+  |warp[2,0]|...                           |
+  +─────────+──────────────────────────────+
+  |warp[3,0]|warp[3,1]|warp[3,2]|warp[3,3]|
+  +─────────+─────────+─────────+─────────+
+  WM=64 tall per warp-row
+
+  NWarps_dim_M = BM / WM = 256 / 64 = 4
+  NWarps_dim_N = BN / WN = 128 / 32 = 4
+  Total warps  = 4 * 4 = 16
+  Total threads = 16 * 32 = 512 = cta_size
+
+WK: HOW MUCH OF K ONE WARP PROCESSES PER INNER STEP
+-----------------------------------------------------
+  WK=8
+  Within each BK=16 outer tile, the warp steps through K in chunks of 8.
+  Inner loop iterations = BK / WK = 16 / 8 = 2 steps per outer iteration.
+  Step 1 (wk_id=0): process k-rows 0..7 of shared memory tile
+  Step 2 (wk_id=1): process k-rows 8..15 of shared memory tile
+
+TM, TN: OUTPUT TILE THAT ONE THREAD COMPUTES (inside warp's tile)
+------------------------------------------------------------------
+  TM=8, TN=8
+  Each of 32 lanes in a warp owns an 8 x 8 = 64 element output sub-tile.
+
+  Each lane holds 64 floats in tCrC[] registers throughout the K-loop,
+  accumulating without ever writing back to shared memory until the end.
+
+  Check: 32 lanes * TM * TN = 32 * 8 * 8 = 2048 = WM * WN = 64 * 32 = 2048
+
+TK: STEP SIZE OF THE INNERMOST ACCUMULATION LOOP
+-------------------------------------------------
+  TK=1
+  Controls unrolling granularity inside mma():
+    for tk in 0, TK, 2*TK, ..., WK-TK:    <- WK/TK outer steps
+      for k in 0..TK-1:                    <- TK inner steps
+        outer product of A-col * B-row -> added to tCrC
+
+  TK=1: compiler unrolls all WK=8 multiply-add steps at once (max scheduling)
+  TK=4: unrolls 4 at a time, outer loop 2 iterations (less code size)
+  TK=WK: one outer iteration, everything unrolled (maximum unrolling)
+
+REGISTER USE PER THREAD
+-----------------------
+  tArA: WK * TM = 8 * 8 = 64 floats  <- A values for this thread's k-range
+  tBrB: WK * TN = 8 * 8 = 64 floats  <- B values for this thread's k-range
+  tCrC: TM * TN = 8 * 8 = 64 floats  <- accumulator (lives in registers entire time)
+  Total: 192 registers per thread
+
+
+================================================================
+Q4. WHY tArA IS SIZED WK*TM, NOT TK*TM
+================================================================
+
+THE REGISTER ARRAYS ARE DECLARED AS:
+  float tArA[WK*TM]   = 64 floats
+  float tBrB[WK*TN]   = 64 floats
+
+THEY HOLD ALL WK K-VALUES PRE-LOADED AT ONCE
+
+In load_Shared_To_Reg:
+  for (int kid=0; kid < WK; ++kid):    <- loops WK=8 times
+    store into tArA[kid * TM + 0..TM-1]
+    store into tBrB[kid * TN + 0..TN-1]
+
+After this call, tArA contains WK*TM = 64 floats (all 8 k-values pre-loaded).
+
+In mma:
+  for tk in 0..WK-1 (step TK):
+    for k in 0..TK-1:
+      _k = tk + k
+      tCrC[m][n] += tArA[_k * TM + m] * tBrB[_k * TN + n]
+
+mma reads from tArA at _k = 0..WK-1. All WK*TM elements are used.
+
+DISTINCTION:
+  WK = how many k-values are PRE-LOADED into registers -> determines array size
+  TK = how many k-values are CONSUMED per mma outer step -> controls loop unrolling
+
+IF tArA WERE SIZED TK*TM (only TK values):
+  Would need to call load_Shared_To_Reg WK/TK times, alternating with mma.
+  Each shared memory read has ~20-30 cycle latency.
+  Result: computation stalls waiting for each load.
+
+WHY PRE-LOADING ALL WK AT ONCE IS FASTER:
+  1. Issue all WK*(TM+TN) loads back-to-back (16 loads issued immediately)
+  2. GPU Load-Store Units pipeline all loads simultaneously
+  3. By the time mma needs k=0 data, k=7 data has also arrived
+  4. All 8 outer products run from registers with no further shared memory traffic
+
+
+================================================================
+Q5. THE mma FORMULA: WHY tArA[_k*TM+m] AND NOT tArA[m*TM+_k]?
+================================================================
+
+THERE IS A TRANSPOSE IN THE REGISTER LAYOUT OF tArA
+
+NATURAL (M-MAJOR) LAYOUT WOULD BE:
+  tArA[m][k]  ->  flat index: tArA[m * WK + k]    (m is row, k is col)
+  Then mma line would be: tCrC[m][n] += tArA[m * WK + _k] * tBrB[...]
+
+ACTUAL (K-MAJOR) LAYOUT IN THE CODE:
+  tArA[k][m]  ->  flat index: tArA[k * TM + m]    (k is row, m is col)
+  mma line:       tCrC[m][n] += tArA[_k * TM + m] * tBrB[_k * TN + n]
+
+WHERE THE TRANSPOSE HAPPENS: load_Shared_To_Reg
+  for (int kid=0; kid < WK; ++kid):
+    get_offset(vec_t, tArA, kid, _m, TM)[0] = ...
+    address = tArA + kid * TM + _m    <- kid is ROW, _m is COL, stride=TM
+    => tArA is stored k-major [WK][TM]
+
+tArA MEMORY LAYOUT:
+  offset 0..7:   k=0 row: [A[m0][k0], A[m1][k0], A[m2][k0], ..., A[m7][k0]]
+  offset 8..15:  k=1 row: [A[m0][k1], A[m1][k1], ..., A[m7][k1]]
+  ...
+  offset 56..63: k=7 row: [A[m0][k7], A[m1][k7], ..., A[m7][k7]]
+
+WHY K-MAJOR IS BETTER:
+  In mma inner loop for fixed _k, iterating over m:
+    K-major: tArA[_k*TM+0], tArA[_k*TM+1], ..., tArA[_k*TM+7]  <- stride 1
+    M-major: tArA[0*WK+_k], tArA[1*WK+_k], ..., tArA[7*WK+_k]  <- stride WK=8
+
+  Stride-1 access enables better compiler instruction scheduling.
+
+FULL TRANSPOSE CHAIN FOR A:
+  Global memory:   A[m][k]   (M x K, row-major)
+       | load_Global_To_Shared with trans=true
+  Shared memory:   sA[k][m]  (BK x BM, k-major)   <- first transpose
+       | load_Shared_To_Reg
+  Registers:       tArA[k][m] (WK x TM, k-major)   <- same orientation
+       | mma: tCrC[m][n] += tArA[k][m] * tBrB[k][n]   <- reads correctly
+
+B HAS NO TRANSPOSE:
+  Global:    B[k][n]   (K x N, row-major)
+  Shared:    sB[k][n]  (BK x BN, no transpose)
+  Registers: tBrB[k][n] -> tBrB[_k*TN + n], stride-1 in n
+
+
+================================================================
+Q6. THE local_tile MACRO
+================================================================
+
+DEFINITION:
+  #define local_tile(ptr, tileM, tileN, row, col, ld) \
+      ((ptr) + (row)*(tileM)*(ld) + (col)*(tileN))
+
+WHAT IT DOES:
+  Given a 2D matrix divided into tileM x tileN blocks, returns a pointer
+  to the top-left corner of tile [row][col].
+
+PARAMETERS:
+  ptr    - base pointer (top-left of the whole matrix)
+  tileM  - tile height (rows per tile)
+  tileN  - tile width (cols per tile)
+  row    - which tile-row
+  col    - which tile-col
+  ld     - leading dimension = full matrix width (stride between rows)
+
+FORMULA BREAKDOWN:
+  (row) * (tileM) * (ld)   +   (col) * (tileN)
+    ^         ^        ^          ^       ^
+  tile-row rows/tile row-stride  tile-col cols/tile
+
+  = skip (row * tileM) full rows down, each row is ld elements wide
+  + skip (col * tileN) columns right
+
+WHY ld IS ALWAYS THE FULL MATRIX WIDTH (NOT TILE WIDTH):
+  Rows are stored contiguously at full width in memory.
+  To jump from row 0 to row 1, skip ld elements (full row width), not tileN.
+
+THREE CONCRETE USES:
+
+  1. CTA tile in output C:
+     tCtCgC = local_tile(gC, BM, BN, bmid, bnid, ldc)
+     BM=256, BN=128, ldc=N=6144, bmid=1, bnid=2:
+     offset = 1*256*6144 + 2*128 = 1572864 + 256 = 1573120
+     -> points to C[256][256]
+
+  2. CTA tile in input A:
+     tAgA = local_tile(gA, BM, BK, bmid, bkid, lda)
+     BM=256, BK=16, lda=K=4096, bmid=1, bkid=3:
+     offset = 1*256*4096 + 3*16 = 1048576 + 48 = 1048624
+     -> points to A[256][48]
+
+  3. Warp tile inside shared sA (BK x BM = 16 x 256):
+     tAsA = local_tile(sA, WK, WM, wk_id, wm_id, BM)
+     WK=8, WM=64, BM=256, wk_id=1, wm_id=2:
+     offset = 1*8*256 + 2*64 = 2048 + 128 = 2176
+     -> points to sA[k=8][m=128]
+
+
+================================================================
+Q7. THE get_offset MACRO
+================================================================
+
+DEFINITION:
+  #define get_offset(T, ptr, row, col, ld) ((T*)((ptr) + (row)*(ld) + (col)))
+
+WHAT IT DOES IN TWO STEPS:
+  1. Compute address: ptr + row*ld + col  (standard row-major 2D index)
+  2. Cast to T*: enables loading/storing T-sized elements at that address
+
+PARAMETERS:
+  T    - type to cast to (float, uint4, etc.)
+  ptr  - base pointer (always float* in this code)
+  row  - row index
+  col  - column index
+  ld   - leading dimension (elements per row = stride)
+
+FOLLOWED BY [0] TO DEREFERENCE:
+  get_offset(float, sA, m, n, BM)[0]  = read/write one float (4 bytes)
+  get_offset(uint4, src, m, n, ld)[0] = read/write 4 floats (16 bytes) at once
+
+CASE 1 - float (normal single element):
+  get_offset(float, sA, kid, m, BM)[0]
+  = ((float*)(sA + kid*BM + m))[0]
+  = sA[kid*BM + m]   <- one float
+
+CASE 2 - uint4 (vectorized 4-float load):
+  get_offset(vec_t, src, m, n, ld_src)[0]
+  = ((uint4*)(src + m*ld_src + n))[0]
+
+  Memory at src+m*ld+n:
+  +────+────+────+────+
+  | f0 | f1 | f2 | f3 |  <- 4 floats = 16 bytes
+  +────+────+────+────+
+  one uint4 load [0] fetches all 4 at once (single 128-bit instruction)
+
+WHY NOT JUST WRITE src[m*ld+n]?
+  Normal: tArA[kid*TM+_m] = tAsA[kid*BM+m];  <- 1 float per instruction
+  Vectorized: get_offset(uint4,...)[0] = get_offset(uint4,...)[0]  <- 4 floats
+  Vectorized reduces load/store instructions by 4x, keeps memory pipeline full.
+
+
+================================================================
+Q8. load_Global_To_Shared - VECTORIZED LOAD WITH OPTIONAL TRANSPOSE
+================================================================
+
+SIGNATURE:
+  template <int TileM, int TileN, int cta_size, bool trans, typename vec_t, typename T>
+  __device__ __forceinline__ void load_Global_To_Shared(
+      T* dst, const T* src, int ld_dst, int ld_src, int M, int N, int tid)
+
+CALL SITES:
+  Load A (transposed):
+    load_Global_To_Shared<BM, BK, cta_size, true,  vec_t>(sA[curr], tAgA, BM, lda, ...)
+    TileM=256, TileN=16, trans=true
+
+  Load B (not transposed):
+    load_Global_To_Shared<BK, BN, cta_size, false, vec_t>(sB[curr], tBgB, BN, ldb, ...)
+    TileM=16, TileN=128, trans=false
+
+COMPILE-TIME CONSTANTS (for A loading):
+  vec_size           = sizeof(uint4)/sizeof(float) = 4
+  num_threads_per_N  = TileN / vec_size = 16 / 4 = 4
+  num_vec_elements   = TileM * TileN / vec_size = 256*16/4 = 1024
+  num_loop           = num_vec_elements / cta_size = 1024/512 = 2
+
+THREAD ASSIGNMENT: MAPPING idx TO (m, n)
+  for (loopid=0, idx=tid; loopid < num_loop; ++loopid, idx += cta_size):
+    n = (idx & (num_threads_per_N - 1)) * vec_size
+    m = idx >> get_log2x<num_threads_per_N>()
+
+  idx = m * num_threads_per_N + n_group
+  -> n_group = idx & (num_threads_per_N - 1)   (low bits = column group)
+  -> m       = idx >> log2(num_threads_per_N)   (high bits = row)
+  -> n       = n_group * vec_size
+
+EXAMPLE: Loading A tile (TileM=256, TileN=16, num_threads_per_N=4):
+
+  idx   idx&3   n=(idx&3)*4   idx>>2   m
+    0     0           0         0       0    -> A_tile[row=0][col=0..3]
+    1     1           4         0       0    -> A_tile[row=0][col=4..7]
+    2     2           8         0       0    -> A_tile[row=0][col=8..11]
+    3     3          12         0       0    -> A_tile[row=0][col=12..15]
+    4     0           0         1       1    -> A_tile[row=1][col=0..3]
+  ...
+  511    3          12        127     127    -> A_tile[row=127][col=12..15]
+  512    0           0        128     128    -> A_tile[row=128][col=0..3]  (loop 2)
+  ...
+  1023   3          12        255     255    -> A_tile[row=255][col=12..15]
+
+  Coverage: 256 rows * 16 cols = 4096 floats, 4096/4=1024 vec loads, 512*2=1024 v
+
+EXAMPLE: Loading B tile (TileM=16, TileN=128, num_threads_per_N=32):
+
+  idx   idx&31   n=(idx&31)*4   idx>>5   m
+    0      0           0           0      0    -> B_tile[row=0][col=0..3]
+    1      1           4           0      0    -> B_tile[row=0][col=4..7]
+  ...
+   31     31         124           0      0    -> B_tile[row=0][col=124..127]
+   32      0           0           1      1    -> B_tile[row=1][col=0..3]
+  ...
+  511     31         124          15     15    -> B_tile[row=15][col=124..127]
+
+  One full warp (32 threads) covers one full row of B (128 cols) in 1 loop.
+
+WHY n IN LOW BITS, m IN HIGH BITS:
+  Consecutive threads (same warp) all get same m, different n -> coalesced access.
+  For A: 4 threads per row, each loads 4 floats -> 4 consecutive uint4 loads
+  For B: 32 threads per row, each loads 4 floats -> 32 consecutive uint4 loads (1 row)
+
+NON-TRANSPOSE PATH (trans=false, used for B):
+  get_offset(vec_t, dst, m, n, ld_dst)[0] = get_offset(vec_t, src, m, n, ld_src)[0]
+  Direct copy: same (m, n) position in source and destination.
+  sB[k][n] = B[k][n] (no structural change)
+
+TRANSPOSE PATH (trans=true, used for A):
+  vec_v = get_offset(vec_t, src, m, n, ld_src)[0]
+  // Load 4 floats: A[m][n], A[m][n+1], A[m][n+2], A[m][n+3] (coalesced)
+
+  for vid=0..3:
+    get_offset(T, dst, n+vid, m, ld_dst)[0] = reinterpret_cast<T*>(&vec_v)[vid]
+    // dst[n+vid][m] = A[m][n+vid]    <- TRANSPOSED store
+
+  Concrete example - thread with m=5, n=8:
+    Global load:    A[5][8], A[5][9], A[5][10], A[5][11] -> vec_v
+    Shared writes:
+      sA[8][5]  = A[5][8]
+      sA[9][5]  = A[5][9]
+      sA[10][5] = A[5][10]
+      sA[11][5] = A[5][11]
+
+BOUNDARY CHECK:
+  if (m >= M || n >= N): continue
+  M = rest_m (remaining rows for this block), N = rest_n (remaining cols).
+  For edge blocks: skip loads that would go past the matrix boundary.
+
+
+================================================================
+Q9. load_Shared_To_Reg - SHARED MEMORY TO REGISTER LOADING
+================================================================
+
+SIGNATURE:
+  template <int BM, int BN, int BK, int WM, int WN, int WK, int TM, int TN, vec_t, T>
+  __device__ __forceinline__ void load_Shared_To_Reg(
+      T* tArA, T* tBrB, const T* sA, const T* sB,
+      int wm_id, int wn_id, int wk_id, int tm_vec_id, int tn_vec_id)
+
+COMPILE-TIME CONSTANTS:
+  vec_size     = 4
+  TM_vec_num   = TM / vec_size = 2    <- 2 vectorized loads per thread in M
+  TN_vec_num   = TN / vec_size = 2    <- 2 vectorized loads per thread in N
+  WM_per_loop  = WM / TM_vec_num = 32 <- spacing between the 2 A loads in sA
+  WN_per_loop  = WN / TN_vec_num = 16 <- spacing between the 2 B loads in sB
+
+STEP 1: NAVIGATE TO WARP'S TILE IN SHARED MEMORY
+  tAsA = local_tile(sA, WK, WM, wk_id, wm_id, BM)
+       = sA + wk_id * WK * BM + wm_id * WM
+
+  sA is BK x BM = 16 x 256, organized as warp tiles of WK x WM = 8 x 64:
+         m=0..63    m=64..127  m=128..191  m=192..255
+  k=0..7  wm_id=0    wm_id=1    wm_id=2     wm_id=3   <- wk_id=0
+  k=8..15 wm_id=0    wm_id=1    wm_id=2     wm_id=3   <- wk_id=1
+
+  Example: wk_id=1, wm_id=2:
+    tAsA = sA + 1*8*256 + 2*64 = sA + 2176
+    -> points to sA[k=8][m=128]
+
+  tBsB = local_tile(sB, WK, WN, wk_id, wn_id, BN)
+       = sB + wk_id * WK * BN + wn_id * WN
+
+STEP 2: LOADING A (sA -> tArA)
+  for (int kid=0; kid < WK; ++kid):
+    for (int tm_loop=0; tm_loop < TM_vec_num; ++tm_loop):
+      m  = tm_loop * WM_per_loop + tm_vec_id * vec_size  <- col in sA
+      _m = tm_loop * vec_size                             <- col in tArA
+      tArA[kid * TM + _m .. _m+3] = tAsA[kid][m .. m+3]
+
+  For tm_vec_id=3, kid=0:
+    tm_loop=0: m=0*32+3*4=12, _m=0 -> load sA[0][12..15] into tArA[0][0..3]
+    tm_loop=1: m=1*32+3*4=44, _m=4 -> load sA[0][44..47] into tArA[0][4..7]
+
+  WM=64 columns covered by 8 unique tm_vec_id * 2 loops * 4 floats = 64 = WM
+
+STEP 3: LOADING B (sB -> tBrB)
+  for (int kid=0; kid < WK; ++kid):
+    for (int tn_loop=0; tn_loop < TN_vec_num; ++tn_loop):
+      n  = tn_loop * WN_per_loop + tn_vec_id * vec_size  <- col in sB
+      _n = tn_loop * vec_size                             <- col in tBrB
+      tBrB[kid * TN + _n .. _n+3] = tBsB[kid][n .. n+3]
+
+  For tn_vec_id=1, kid=0:
+    tn_loop=0: n=0*16+1*4=4,  _n=0 -> load sB[0][4..7]   into tBrB[0][0..3]
+    tn_loop=1: n=1*16+1*4=20, _n=4 -> load sB[0][20..23] into tBrB[0][4..7]
+
+  WN=32 columns covered by 4 unique tn_vec_id * 2 loops * 4 floats = 32 = WN
+
+WARP LANE LAYOUT:
+  tm_vec_id = lane_id >> 2   -> values 0..7 (8 unique, 4 lanes each)
+  tn_vec_id = lane_id & 3    -> values 0..3 (4 unique, 8 lanes each)
+
+  For A loading:
+    4 lanes sharing tm_vec_id -> all read same sA address -> BROADCAST (no conflict)
+  For B loading:
+    8 lanes sharing tn_vec_id -> all read same sB address -> BROADCAST (no conflict)
+
+
+================================================================
+Q10. WHY MIX WM, WN, TM, TN IN load_Shared_To_Reg?
+================================================================
+
+THEY SERVE TWO SEPARATE JOBS
+
+JOB 1: Navigate to the warp's tile in shared memory (uses WM, WN)
+  tAsA = local_tile(sA, WK, WM, wk_id, wm_id, BM)
+  WM tells local_tile how wide each warp-column is -> determines pointer offset
+
+JOB 2: Split that warp tile among 32 threads (uses TM via TM_vec_num)
+  TM_vec_num  = TM / vec_size = 2
+  WM_per_loop = WM / TM_vec_num = 32   <- this requires BOTH WM and TM
+
+  m = tm_loop * WM_per_loop + tm_vec_id * vec_size
+                  ^                         ^
+             from WM                   from lane_id
+
+WM ALONE IS NOT ENOUGH:
+  Tells you where the warp's tile is, not how to split among 32 threads.
+
+TM ALONE IS NOT ENOUGH:
+  Tells you each thread's share (8 values), not where in sA those values are.
+
+THE KEY RELATIONSHIP:
+  WM / TM = 64 / 8 = 8 unique tm_vec_id positions in the warp
+  WN / TN = 32 / 8 = 4 = threads sharing the same A load (broadcast factor)
+  WM / TM = 8 unique A positions; WN / TN = 8 threads sharing each B position
+
+SUMMARY:
+  WM: total M elements this warp owns = 64
+  TM: each thread's M share = 8
+  WM_per_loop = WM / TM_vec_num = spacing between thread's two A loads in sA
+
+
+================================================================
+Q11. BANK CONFLICTS: OPTION 1 (stride=4) vs OPTION 2 (stride=8)
+================================================================
+
+SETUP: WM=64, TM=8, vec_size=4, 8 unique tm_vec_id values (0..7)
+
+THE TWO OPTIONS FOR THREAD 0 (tm_vec_id=0) LOADING ACROSS 2 LOOPS:
+  Option 1 (code): m=0 (tm_loop=0) and m=32 (tm_loop=1) -> SEPARATED
+  Option 2 (contiguous): m=0 (tm_loop=0) and m=4 (tm_loop=1) -> ADJACENT
+
+SHARED MEMORY BANK RULE:
+  32 banks, 4 bytes each.
+  bank(sA[k][m]) = m % 32
+  CONFLICT: different threads, different addresses, same bank -> serialized
+  BROADCAST: multiple threads, SAME address -> 1 transaction, no penalty
+
+OPTION 1 (stride=4, WM_per_loop=32): tm_loop=0, all 32 lanes execute together:
+  tm_vec_id=0: m=0,  banks 0,1,2,3
+  tm_vec_id=1: m=4,  banks 4,5,6,7
+  tm_vec_id=2: m=8,  banks 8,9,10,11
+  tm_vec_id=3: m=12, banks 12,13,14,15
+  tm_vec_id=4: m=16, banks 16,17,18,19
+  tm_vec_id=5: m=20, banks 20,21,22,23
+  tm_vec_id=6: m=24, banks 24,25,26,27
+  tm_vec_id=7: m=28, banks 28,29,30,31
+  All 32 banks hit once each -> NO CONFLICT
+
+  tm_loop=1: m=32,36,40,...,60
+  tm_vec_id=0: m=32, banks 32%32=0, 1, 2, 3
+  tm_vec_id=1: m=36, banks 4,5,6,7
+  ...
+  All still spread across 32 banks -> NO CONFLICT
+
+OPTION 2 (stride=8, contiguous per thread): tm_loop=0, all 32 lanes:
+  tm_vec_id=0: m=0,  banks 0,1,2,3
+  tm_vec_id=1: m=8,  banks 8,9,10,11
+  tm_vec_id=2: m=16, banks 16,17,18,19
+  tm_vec_id=3: m=24, banks 24,25,26,27
+  tm_vec_id=4: m=32, banks 0,1,2,3   <- SAME BANKS AS tm_vec_id=0! CONFLICT!
+  tm_vec_id=5: m=40, banks 8,9,10,11 <- CONFLICT with tm_vec_id=1!
+  tm_vec_id=6: m=48, banks 16,17,18,19 <- CONFLICT!
+  tm_vec_id=7: m=56, banks 24,25,26,27 <- CONFLICT!
+  4 pairs of 2-way bank conflicts -> 2 serialized rounds
+
+ROOT CAUSE:
+  Option 1: stride 4 * 8 groups = 32 elements -> all within banks 0..31 (no wrap)
+  Option 2: stride 8 * 8 groups = 64 elements -> wraps around 32 banks twice -> aliasing
+
+
+================================================================
+Q12. WHAT ARE THE OTHER 24 THREADS DOING DURING A LOADING?
+================================================================
+
+ALL 32 THREADS ARE ACTIVE AND EXECUTING THE SAME LOAD INSTRUCTIONS.
+NONE ARE IDLE.
+
+The 32 lanes are arranged in an 8 x 4 grid:
+  tm_vec_id = lane_id >> 2  -> 0..7  (8 unique values, 4 lanes each)
+  tn_vec_id = lane_id & 3   -> 0..3  (4 unique values, 8 lanes each)
+
+DURING A LOADING: all 32 lanes execute the A load code.
+  The 4 lanes sharing tm_vec_id=0 all compute m=0 and m=32 -> same sA addresses.
+  They read from the SAME shared memory addresses -> BROADCAST (free).
+  Each lane stores the result into its OWN private tArA registers.
+
+Why 4 lanes do the same A load redundantly:
+  They have tn_vec_id=0,1,2,3 -> they compute different N output columns.
+  For mma: tCrC[m][n] += tArA[k][m] * tBrB[k][n]
+  Same A (same m-range) * different B (different n-range) = different tCrC output.
+  Each needs its own tArA copy in registers to run mma independently.
+
+DURING B LOADING: all 32 lanes execute the B load code.
+  The 8 lanes sharing tn_vec_id=0 all compute n=0 and n=16 -> same sB addresses.
+  Broadcast, free.
+  Each lane stores into its own private tBrB registers.
+
+FULL PICTURE:
+  Phase        What each of the 32 threads does
+  A loading:   All 32 execute. 4 threads per group (same tm_vec_id) hit same sA
+               address -> broadcast. Each stores into own tArA registers.
+  B loading:   All 32 execute. 8 threads per group (same tn_vec_id) hit same sB
+               address -> broadcast. Each stores into own tBrB registers.
+  mma():       All 32 threads compute their own 8x8=64 tCrC simultaneously from
+               private registers. Zero shared memory traffic.
+
+
+================================================================
+Q13. B LOADING: LANE GROUPS AND ADDRESSES
+================================================================
+
+HOW tm_vec_id AND tn_vec_id ARE COMPUTED (from kernel code):
+
+  int tid     = threadIdx.y * blockDim.x + threadIdx.x   <- (0..511)
+  int warp_id = tid >> 5                                  <- (0..15)
+  int lane_id = tid & 0x1F                                <- (0..31)
+
+  constexpr int TN_vec_num  = TN / vec_size = 2
+  constexpr int WN_per_loop = WN / TN_vec_num = 16
+
+  tm_vec_id = lane_id >> get_log2x<WN_per_loop/vec_size>()
+            = lane_id >> log2(16/4)
+            = lane_id >> 2              -> values 0..7
+
+  tn_vec_id = lane_id & (WN_per_loop/vec_size - 1)
+            = lane_id & 3              -> values 0..3
+
+WHICH LANES ARE IN EACH tn_vec_id GROUP:
+  tn_vec_id = lane_id & 3
+  tn=0: lane_id & 3 = 0 -> lanes 0, 4, 8, 12, 16, 20, 24, 28  (8 lanes)
+  tn=1: lane_id & 3 = 1 -> lanes 1, 5, 9, 13, 17, 21, 25, 29  (8 lanes)
+  tn=2: lane_id & 3 = 2 -> lanes 2, 6, 10, 14, 18, 22, 26, 30 (8 lanes)
+  tn=3: lane_id & 3 = 3 -> lanes 3, 7, 11, 15, 19, 23, 27, 31 (8 lanes)
+
+WHAT kid IS:
+  kid = loop variable in load_Shared_To_Reg: for (int kid=0; kid<WK; ++kid)
+  It is NOT thread-specific. All 32 threads step through kid=0..7 together.
+  tBsB = local_tile(sB, WK, WN, wk_id, wn_id, BN) points to warp's K x N slice.
+  get_offset(vec_t, tBsB, kid, n, BN) accesses row=kid within the warp tile.
+
+B LOADING FOR EACH tn_vec_id GROUP:
+  B load formula:  n = tn_loop * WN_per_loop + tn_vec_id * vec_size
+                   _n = tn_loop * vec_size
+
+  tn=0 (8 lanes: 0,4,8,12,16,20,24,28):
+    tn_loop=0: n=0*16+0*4=0,   _n=0 -> load tBsB[kid][0..3]   -> tBrB[kid][0..3]
+    tn_loop=1: n=1*16+0*4=16,  _n=4 -> load tBsB[kid][16..19] -> tBrB[kid][4..7]
+
+  tn=1 (8 lanes: 1,5,9,13,17,21,25,29):
+    tn_loop=0: n=4,  _n=0 -> load tBsB[kid][4..7]   -> tBrB[kid][0..3]
+    tn_loop=1: n=20, _n=4 -> load tBsB[kid][20..23] -> tBrB[kid][4..7]
+
+  tn=2 (8 lanes):
+    tn_loop=0: n=8,  -> tBsB[kid][8..11]
+    tn_loop=1: n=24, -> tBsB[kid][24..27]
+
+  tn=3 (8 lanes):
+    tn_loop=0: n=12, -> tBsB[kid][12..15]
+    tn_loop=1: n=28, -> tBsB[kid][28..31]
+
+  Coverage: 4 groups * 2 loops * 4 floats = 32 = WN
+  8 lanes per group hit same address -> BROADCAST, 1 transaction each
+
+
+================================================================
+Q14. WHY ALL 32 THREADS NEED THEIR OWN REGISTER COPY
+================================================================
+
+EACH LANE HAS A UNIQUE (tm_vec_id, tn_vec_id) PAIR -> UNIQUE OUTPUT REGION:
+  Lane 0: tm=0, tn=0 -> computes C_warp[m=0..7 ][n=0..7 ]
+  Lane 1: tm=0, tn=1 -> computes C_warp[m=0..7 ][n=8..15]
+  Lane 4: tm=1, tn=0 -> computes C_warp[m=8..15][n=0..7 ]
+  Lane 5: tm=1, tn=1 -> computes C_warp[m=8..15][n=8..15]
+
+In mma for every lane simultaneously:
+  tCrC[m*TN+n] += tArA[k*TM+m] * tBrB[k*TN+n]
+
+Lane 0 and Lane 1 (same tm=0, different tn):
+  Both have same tArA (m=0..7 rows of A)
+  Lane 0's tBrB = B cols 0..7; Lane 1's tBrB = B cols 8..15 -> different results
+  -> They compute to different tCrC regions -> cannot share one tCrC register array
+
+Lane 0 and Lane 4 (different tm, same tn=0):
+  Lane 0's tArA = A rows 0..7; Lane 4's tArA = A rows 8..15 -> different A data
+  Both have same tBrB (B cols 0..7)
+  -> Cannot share one tArA register array
+
+REGISTERS ARE PRIVATE: There is no "shared register" concept in CUDA.
+  All 32 lanes execute mma() simultaneously.
+  Each lane uses its own tArA, tBrB, tCrC register files independently.
+  The redundant loads (same sA/sB addresses) are the price of register blocking.
+
+
+================================================================
+Q15. lane_id vs thread_id: THEY ARE NOT THE SAME
+================================================================
+
+THE THREE IDs:
+  tid     = threadIdx.y * blockDim.x + threadIdx.x   <- in block (0..511)
+  warp_id = tid >> 5                                  <- which warp (0..15)
+  lane_id = tid & 0x1F                                <- position in warp (0..31)
+
+RELATIONSHIP: tid = warp_id * 32 + lane_id
+
+CONCRETE TABLE (subset):
+  tid    warp_id   lane_id   tm_vec_id   tn_vec_id
+    0       0         0          0           0
+    1       0         1          0           1
+    2       0         2          0           2
+    3       0         3          0           3
+    4       0         4          1           0
+   31       0        31          7           3
+   32       1         0          0           0   <- lane_id resets here!
+   33       1         1          0           1
+   63       1        31          7           3
+   64       2         0          0           0
+  511      15        31          7           3
+
+KEY POINT: lane_id = 0 appears for tid=0, tid=32, tid=64, ...
+  These are different threads in different warps.
+  Same lane_id -> same (tm_vec_id, tn_vec_id) -> same thread-level loading pattern
+  Different warp_id -> different (wm_id, wn_id) -> different tile in shared memory
+
+FULL THREAD IDENTITY: (wm_id, wn_id, tm_vec_id, tn_vec_id)
+  wm_id, wn_id: which warp tile in the block (from warp_id)
+  tm_vec_id, tn_vec_id: where within that warp tile (from lane_id)
+
+
+================================================================
+Q16. BANK CONFLICTS WITH ALL 32 THREADS IN THE WARP
+================================================================
+
+USER CONCERN: even if 8 unique tm_vec_id groups have no conflict among themselves,
+do the 4 threads sharing each tm_vec_id cause conflicts?
+
+ANSWER: NO. The rule is BROADCAST.
+
+When 4 threads (tn_vec_id=0,1,2,3 within tm_vec_id=0) all access the SAME sA address:
+  -> BROADCAST: 1 transaction serves all 4 threads simultaneously, no penalty.
+
+BROADCAST vs CONFLICT:
+  BROADCAST: multiple threads, SAME address -> 1 transaction, FREE
+  CONFLICT:  multiple threads, DIFFERENT addresses, same BANK -> serialized, SLOW
+
+For Option 1 during A loading (tm_loop=0):
+  Group 0 (4 lanes): all read sA[kid][0..3] -> broadcast, banks 0-3 used
+  Group 1 (4 lanes): all read sA[kid][4..7] -> broadcast, banks 4-7 used
+  ...
+  Group 7 (4 lanes): all read sA[kid][28..31] -> broadcast, banks 28-31 used
+  8 unique addresses, 8 unique bank ranges, no overlap -> ZERO CONFLICTS
+
+The "other 24 threads" (those not in Group 0) do not cause conflicts for Group 0
+because they access DIFFERENT bank ranges (4-31), not the same banks.
+
+CONCLUSION: All 32 threads, zero conflicts, with Option 1.
+
+
+================================================================
+Q17. store_Reg_To_Global - WRITING tCrC BACK TO GLOBAL MEMORY
+================================================================
+
+WHAT IT DOES:
+  Takes thread's 64-float accumulator tCrC[TM][TN] (in registers) and writes
+  it back to global C. This is the final step after all K-iterations.
+
+COMPILE-TIME CONSTANTS:
+  VecSz       = 4
+  TM_vec_num  = TM / VecSz = 2
+  TN_vec_num  = TN / VecSz = 2
+  WM_per_loop = WM / TM_vec_num = 32
+  WN_per_loop = WN / TN_vec_num = 16
+
+STEP 1: NAVIGATE TO WARP'S OUTPUT TILE:
+  tCtCgC = local_tile(tCgC, WM, WN, wm_id, wn_id, ldc)
+  tCgC already points to block's BM x BN tile.
+  local_tile advances to warp's WM x WN sub-tile.
+
+STEP 2: BOUNDARY CHECK:
+  validM = M - wm_id * WM_per_loop
+  validN = N - wn_id * WN_per_loop
+  (M = rest_m = remaining rows for this block)
+  Skips stores for edge blocks where the warp tile extends past the matrix.
+
+STEP 3: COMPUTING GLOBAL POSITION (m, n) AND REGISTER POSITION (_m, _n):
+
+  m  = tm_loop * WM_per_loop + tm_vec_id * VecSz + vid   <- global row in warp tile
+  _m = tm_loop * VecSz + vid                              <- row in tCrC
+
+  n  = tn_loop * WN_per_loop + tn_vec_id * VecSz         <- global col in warp tile
+  _n = tn_loop * VecSz                                    <- col in tCrC
+
+EXAMPLE: tm_vec_id=3, tn_vec_id=1, all loop iterations:
+
+  Register tCrC positions (_m, _n) -> Global C positions (m, n):
+
+  tm_loop=0, vid=0: _m=0, m=0*32+3*4+0=12   tn_loop=0: _n=0, n=4  -> tCrC[0][0..3] -> C[12][4..7]
+  tm_loop=0, vid=0:                           tn_loop=1: _n=4, n=20 -> tCrC[0][4..7] -> C[12][20..23]
+  tm_loop=0, vid=1: _m=1, m=13               tn_loop=0: _n=0, n=4  -> tCrC[1][0..3] -> C[13][4..7]
+  ...
+  tm_loop=0, vid=3: _m=3, m=15               ...
+  tm_loop=1, vid=0: _m=4, m=1*32+3*4+0=44   tn_loop=0: _n=0, n=4  -> tCrC[4][0..3] -> C[44][4..7]
+  ...
+  tm_loop=1, vid=3: _m=7, m=47               tn_loop=1: _n=4, n=20 -> tCrC[7][4..7] -> C[47][20..23]
+
+  Result: tCrC[0..7][0..7] (64 consecutive register slots) stored to
+          global rows 12,13,14,15,44,45,46,47 and cols 4..7, 20..23.
+
+STORE INSTRUCTION:
+  get_offset(VecT, tCtCgC, m, n, ldc)[0] = get_offset(VecT, tCrC, _m, _n, TN)[0]
+  N dimension: vectorized (uint4, 4 floats per store instruction)
+  M dimension: scalar (each vid step stores 4 floats to a different row)
+
+INVERSE OF LOAD:
+  Load time:   sA[kid][m=12..15] -> tArA[kid][_m=0..3]  (interleaved -> packed)
+               sA[kid][m=44..47] -> tArA[kid][_m=4..7]
+  Store time:  tCrC[_m=0..3]    -> C[m=12..15]          (packed -> interleaved)
+               tCrC[_m=4..7]    -> C[m=44..47]
+  The interleaved pattern (chosen for bank conflict avoidance) is undone at store.
+
+
+================================================================
+Q18. WHY TRANSPOSE A, NOT B?
+================================================================
+
+THE INNER LOOP NEEDS:
+  A: a COLUMN of A (fixed k, varying m)  <- different threads need different rows
+  B: a ROW of B    (fixed k, varying n)  <- different threads need different cols
+
+A COLUMN ACCESS IN ROW-MAJOR MEMORY:
+  A is M x K, row-major, stride K.
+  A[0][k], A[1][k], A[2][k], ... are K elements apart -> STRIDED, not sequential.
+
+B ROW ACCESS IN ROW-MAJOR MEMORY:
+  B is K x N, row-major, stride N.
+  B[k][0], B[k][1], B[k][2], ... are 1 element apart -> SEQUENTIAL, coalesced.
+
+WITHOUT TRANSPOSE: sA stored as [BM][BK], access sA[m][kid] for varying m:
+  Address = m * BK + kid, stride = BK = 16 between threads -> bank conflicts
+
+WITH TRANSPOSE: sA stored as [BK][BM], access sA[kid][m] for varying m:
+  Address = kid * BM + m, stride = 1 between threads -> sequential, no conflicts
+
+COULD WE TRANSPOSE B INSTEAD?
+  Transposed B stored as [BN][BK], access sB[n][kid] for varying n:
+  Address = n * BK + kid, stride = BK -> strided -> WORSE
+
+  B's natural layout [BK][BN] already gives sB[kid][n], stride=1 -> already optimal.
+  Transposing B would BREAK the coalescing that already exists.
+
+GLOBAL LOAD ALSO FAVORS THIS CHOICE:
+  For A: load A[m][k..k+3] (row slice, consecutive k) as uint4 -> coalesced
+         then scatter to sA[k][m], sA[k+1][m], ... (transposed store)
+  For B: load B[k][n..n+3] (row slice, consecutive n) as uint4 -> coalesced
+         store to sB[k][n..n+3] (same orientation) -> no transpose needed
+
+SUMMARY:
+  Matrix    Natural access     Inner loop needs    sA/sB layout    Transpose?
+  A (M x K) row = m, col = k  column (fixed k)    [k][m] k-major  YES
+  B (K x N) row = k, col = n  row    (fixed k)    [k][n] k-major  NO
+
+
+================================================================
+Q19. WHY WK NOT TK IN THE mma OUTER LOOP?
+================================================================
+
+THE mma FUNCTION:
+  for (int tk=0; tk<WK; tk+=TK):      <- outer loop: WK/TK steps
+    for (int k=0; k<TK; ++k):         <- inner loop: TK iterations each
+      _k = tk + k                      <- covers all values 0..WK-1
+      for m in 0..TM-1:
+        for n in 0..TN-1:
+          tCrC[m*TN+n] += tArA[_k*TM+m] * tBrB[_k*TN+n]
+
+tArA IS SIZED WK*TM = 64 FLOATS, ALL WK K-VALUES PRE-LOADED.
+The mma must process ALL WK k-values to produce the correct result.
+
+IF WE REPLACED WK WITH TK IN THE OUTER LOOP:
+  for (int tk=0; tk<TK; tk+=TK):   <- TK=1: runs once (tk=0 only)
+    for (int k=0; k<TK; ++k):      <- k=0 only
+      _k = 0
+      compute one outer product (tArA[0][m] * tBrB[0][n])
+      -> processes _k=0 only, 7 k-values UNPROCESSED, WRONG RESULT
+
+WITH WK=8, TK=1:
+  Outer loop: tk = 0,1,2,3,4,5,6,7  (8 steps, step=TK=1)
+  Inner loop: k = 0 only
+  _k: 0,1,2,3,4,5,6,7 -> all 8 k-values processed -> CORRECT
+
+WHY THE TWO-LOOP STRUCTURE (not just one loop over WK)?
+
+  TK controls partial unrolling granularity:
+    TK=1: outer runs 8 times, inner runs 1 time (same as one loop over WK)
+    TK=2: outer runs 4 times, inner runs 2 times (2x unroll)
+    TK=4: outer runs 2 times, inner runs 4 times (4x unroll)
+    TK=WK: outer runs 1 time, inner runs 8 times (full unroll)
+
+  Both loops have #pragma unroll. The inner loop (TK iterations) is fully unrolled.
+  The outer loop (WK/TK iterations) is also unrolled.
+
+  Larger TK -> more FMADs visible to compiler at once -> better ILP
+             -> but larger code size (instruction cache pressure)
+  TK=1 with unrolled outer loop = compiler sees all 8 multiply-adds, schedules freely
+
+MEMORY LAYOUT CONFIRMS WK IS CORRECT:
+  tArA declared: float tArA[WK * TM]  = float tArA[64]
+  Indexed as tArA[_k * TM + m] where _k = 0..WK-1
+  All 64 elements must be read. Outer loop range must be WK, not TK.
+  TK is the STEP SIZE. WK is the TOTAL COUNT.
+
+ANALOGY:
+  Summing 8 numbers (WK=8), 2 at a time (TK=2):
+    outer loop: 4 iterations (8/2=4)
+    inner loop: 2 additions per iteration
+    Total: 8 additions, all numbers summed
+  If outer loop only ran TK=2 times: only 4 numbers summed, WRONG.
+
+
+================================================================
+END OF PART II: batchedMatrixMultiplicationV1.cu
+================================================================
+
+
+================================================================
+Q20. more FMADs visible at once → compiler can interleave them for better ILP, but uses more instruction cache.
+what is FMAD, ILP
+================================================================
+
+**Excellent question!** Here's a clear explanation of **FMAD** and **ILP** in the context of the sentence you quoted (which is about GPU / CUDA compiler optimizations).
+
+---
+
+### 1. **FMAD = Fused Multiply-Add**
+
+**FMAD** (or more commonly **FMA** = Fused Multiply-Add) is a single machine instruction that performs:
+
+```
+D = A × B + C
+```
+
+in **one step**, instead of two separate instructions (`multiply` + `add`).
+
+#### Why it matters:
+- **Higher performance**: One instruction instead of two → better throughput.
+- **Better accuracy**: The intermediate multiply result is **not rounded** before adding (fused), reducing floating-point error.
+- On modern NVIDIA GPUs (since Kepler/Fermi), the hardware has dedicated **FMA units**.
+
+In CUDA code, this is automatically used when you write something like:
+```cuda
+float result = a * b + c;     // Compiler usually turns this into FMAD/FMA
+```
+
+In low-level GPU assembly (SASS), you will see instructions like:
+- `FFMA` (Float Fused Multiply-Add)
+- `DFMA` (Double)
+- `HFMA` (Half precision)
+
+So when people say "**more FMADs visible at once**", they mean the compiler can see many independent `a*b+c` operations in the code at the same time.
+
+---
+
+### 2. **ILP = Instruction-Level Parallelism**
+
+**ILP** is the ability of the processor (in this case, a GPU Streaming Multiprocessor) to execute **multiple independent instructions in parallel** within the **same thread**.
+
+#### Key Idea:
+Even though a single thread looks sequential in your code, if there are instructions that **do not depend** on each other, the hardware + compiler can execute them at the same time.
+
+**Example of good ILP:**
+```cuda
+float a = x * y + z;
+float b = p * q + r;
+float c = m * n + o;
+float d = u * v + w;     // These 4 FMADs have no dependency between them
+```
+
+The compiler can **interleave** these instructions so the GPU can keep its execution units busy instead of waiting.
+
+---
+
+### 3. Why the Original Statement Makes Sense
+
+> **"more FMADs visible at once → compiler can interleave them for better ILP, but uses more instruction cache."**
+
+**Explanation:**
+
+- If the compiler can see **many independent FMADs** in your code (high ILP), it can **reorder / interleave** them cleverly.
+- This helps hide **latency** (e.g., waiting for global memory or shared memory).
+- The GPU warp scheduler can switch between different instructions more effectively → higher performance.
+
+**Downside:**
+- To expose more FMADs at once, the compiler often needs to **unroll loops** or keep more temporary values in registers.
+- This results in **longer code** (more instructions), which increases **instruction cache pressure** (I-cache).
+
+If too many instructions are generated, the instruction cache may thrash (misses), which can hurt performance — especially on smaller GPUs or kernels with very large code.
+
+---
+
+### 4. Simple Real-World Example
+
+**Poor ILP (Low performance):**
+```cuda
+for(int i = 0; i < N; i++) {
+    sum = sum + a[i] * b[i];        // Only 1 FMAD visible at a time
+}
+```
+
+**Better ILP (after unrolling + register accumulation):**
+```cuda
+float sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+
+for(int i = 0; i < N; i+=4) {
+    sum0 += a[i]   * b[i];      // 4 independent FMADs visible
+    sum1 += a[i+1] * b[i+1];
+    sum2 += a[i+2] * b[i+2];
+    sum3 += a[i+3] * b[i+3];
+}
+sum = sum0 + sum1 + sum2 + sum3;
+```
+
+Now the compiler sees **4 FMADs at once** → can interleave them for much better ILP.
+
+---
+
+**Summary:**
+
+| Term   | Meaning                                 | Benefit                              | Trade-off                     |
+|--------|-----------------------------------------|--------------------------------------|-------------------------------|
+| **FMAD** | Fused Multiply-Add (`a*b + c`)         | Fast + accurate                      | -                             |
+| **ILP**  | Instruction-Level Parallelism           | Hides latency, better utilization    | Needs more registers + I-cache |
+
+Would you like me to also explain related concepts like:
+- **Occupancy** vs ILP
+- How to measure ILP in Nsight Compute
+- Loop unrolling strategy for better ILP
+
+
+
+
+================================================================
+Q21. Occupancy vs ILP 
+================================================================
+
+**Occupancy vs ILP** – Excellent follow-up question!
+
+These are **two different but complementary techniques** for hiding latency and improving performance on GPUs. Here's a clear, detailed comparison.
+
+---
+
+### 1. **Definitions**
+
+| Concept      | Full Name                          | What it means                                                                 | Main Goal                     |
+|--------------|------------------------------------|-------------------------------------------------------------------------------|-------------------------------|
+| **Occupancy** | Warp Occupancy                     | How many warps are **actively running** on an SM compared to the maximum possible | **Latency hiding through thread-level parallelism** |
+| **ILP**       | Instruction-Level Parallelism      | How many **independent instructions** inside a **single thread** (or warp) can execute in parallel | **Latency hiding inside one thread** |
+
+---
+
+### 2. **Core Difference**
+
+- **Occupancy** = **More Warps** (many threads)
+  - Relies on having **lots of threads/blocks** running on the SM.
+  - When one warp stalls (e.g. waiting for global memory), the scheduler quickly switches to another ready warp.
+
+- **ILP** = **More Work per Thread**
+  - Relies on the compiler and code having many **independent instructions** inside the **same thread**.
+  - The execution units inside the SM can work on multiple instructions from the **same warp** without needing to switch warps.
+
+---
+
+### 3. **Detailed Comparison**
+
+| Aspect                    | Occupancy                                      | ILP                                              |
+|---------------------------|------------------------------------------------|--------------------------------------------------|
+| **Level**                 | Thread / Warp level                            | Instruction level (inside one thread)            |
+| **How it hides latency**  | Warp switching (context switch)                | Instruction interleaving / pipelining            |
+| **Requires**              | Many resident blocks & threads                 | Independent operations (e.g. many FMADs)         |
+| **Register usage**        | Usually lower per thread (to fit more blocks)  | Higher (needs many live registers)               |
+| **Instruction Cache**     | Lower pressure                                 | Higher pressure (more code from unrolling)       |
+| **Best for**              | Memory-bound kernels                           | Compute-bound kernels with many independent ops  |
+| **Limitation**            | Limited by SM resources (registers, shared mem) | Limited by instruction dependencies & scheduler  |
+| **Tool to measure**       | Nsight Compute → Occupancy                     | Nsight Compute → IPC, ILP metrics                |
+
+---
+
+### 4. **Real-World Examples**
+
+#### **Example 1: Memory-Bound Kernel (Good for High Occupancy)**
+
+```cuda
+__global__ void copyKernel(float* dst, float* src, size_t n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[i];        // Heavy global memory access
+    }
+}
+```
+
+- Each thread does very little work → low ILP.
+- To hide memory latency, you need **high occupancy** (many warps ready to switch while waiting for memory).
+
+**Strategy**: Use smaller blocks (e.g. 128–256 threads) to maximize number of resident blocks.
+
+---
+
+#### **Example 2: Compute-Bound Kernel (Good for High ILP)**
+
+```cuda
+__global__ void computeKernel(...) {
+    float r0 = a * b + c;
+    float r1 = d * e + f;
+    float r2 = g * h + i;
+    float r3 = j * k + l;
+    // ... many more independent FMADs
+    result = r0 + r1 + r2 + r3;
+}
+```
+
+- Many independent operations visible at once.
+- Compiler can interleave them → high ILP.
+- Even with **lower occupancy**, performance can be excellent because the warp keeps the execution units busy without stalling.
+
+---
+
+### 5. **The Ideal Balance (Modern GPUs)**
+
+Modern GPUs (Ampere, Ada, Hopper) are very good at **both**:
+
+- **High Occupancy + High ILP** is the best combination.
+- But there is a **trade-off**:
+  - To increase ILP, you often unroll loops and use more registers → fewer blocks can fit → **lower occupancy**.
+  - To increase occupancy, you reduce registers per thread → less room for ILP.
+
+**Rule of Thumb**:
+- **Memory-heavy kernels** → Prioritize **Occupancy**
+- **Compute-heavy kernels** → Prioritize **ILP**
+- Many real kernels benefit from **moderate occupancy (40–60%) + good ILP**
+
+---
+
+### 6. **How to Check in Practice**
+
+Use **NVIDIA Nsight Compute**:
+
+- **Occupancy**: Look at "Theoretical Occupancy", "Achieved Occupancy", "Registers per Thread", "Blocks per SM".
+- **ILP**: Look at "IPC" (Instructions Per Cycle), "Issue Stall Reasons", "Warp State Statistics".
+
+---
+
+Would you like me to show:
+- A practical example of trading Occupancy for ILP (with code before/after)?
+- Typical good numbers for Occupancy on different GPU architectures?
+- How shared memory usage affects this balance?
+
+
+
+================================================================
+Q22. A practical example of trading Occupancy for ILP (with code before/after)? 
+================================================================
+
+**Yes!** Here's a **practical, real-world example** of trading **Occupancy for ILP**.
+
+### Example: Vector Dot Product (Sum of a[i] * b[i])
+
+This is a very common kernel pattern.
+
+---
+
+### **Version 1: High Occupancy, Low ILP** (Simple Version)
+
+```cuda
+__global__ void dotProduct_Basic(float* a, float* b, float* out, size_t N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+
+    for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
+        sum += a[i] * b[i];        // Only ONE FMAD visible at a time
+    }
+
+    // Simple atomic reduction (not important for this example)
+    atomicAdd(out, sum);
+}
+```
+
+**Characteristics:**
+
+- **Low ILP**: Only one multiplication + addition is visible to the compiler at any moment.
+- **High Occupancy**: Uses very few registers per thread → many blocks/warps can reside on each SM.
+- **Behavior**: The warp spends a lot of time waiting for memory (`a[i]` and `b[i]`), then quickly does one FMAD, then waits again.
+- Good when memory bandwidth is the main bottleneck.
+
+---
+
+### **Version 2: Lower Occupancy, Higher ILP** (Unrolled Version)
+
+```cuda
+__global__ void dotProduct_Unrolled(float* a, float* b, float* out, size_t N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+
+    // Use multiple independent accumulators → exposes many FMADs
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
+
+    for (size_t i = idx; i < N; i += stride * 8) {
+        sum0 += a[i]     * b[i];      // 8 independent FMADs visible
+        sum1 += a[i+stride]   * b[i+stride];
+        sum2 += a[i+2*stride] * b[i+2*stride];
+        sum3 += a[i+3*stride] * b[i+3*stride];
+        sum4 += a[i+4*stride] * b[i+4*stride];
+        sum5 += a[i+5*stride] * b[i+5*stride];
+        sum6 += a[i+6*stride] * b[i+6*stride];
+        sum7 += a[i+7*stride] * b[i+7*stride];
+    }
+
+    float sum = sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7;
+
+    atomicAdd(out, sum);
+}
+```
+
+**Characteristics:**
+
+- **High ILP**: The compiler now sees **8 independent FMADs** at once. It can interleave them, keeping the CUDA cores busy while waiting for memory.
+- **Lower Occupancy**: Uses significantly more registers (at least 8+ extra floats per thread) → fewer warps/blocks can fit on each SM.
+- The loop is also unrolled by 8, increasing instruction count (more pressure on I-cache).
+
+---
+
+### **Trade-off Summary**
+
+| Metric                    | Basic Version              | Unrolled Version              | Winner       |
+|---------------------------|----------------------------|-------------------------------|--------------|
+| Registers per thread      | ~10–16                     | ~30–40+                       | Basic        |
+| Theoretical Occupancy     | High (60–80%)              | Medium (30–50%)               | Basic        |
+| ILP (Instructions in flight) | Low                     | High                          | Unrolled     |
+| Instruction Cache Usage   | Low                        | Higher                        | Basic        |
+| Performance (typical)     | Good for very small data   | Often **faster** on large data| Unrolled     |
+
+---
+
+### **Why This Trade-off Often Wins**
+
+Even though occupancy drops, **performance frequently improves** because:
+
+1. The SM’s execution units stay busier (higher IPC).
+2. Memory latency is better hidden **inside the same warp** instead of relying only on switching warps.
+3. On modern GPUs (Ampere/Ada/Hopper), having moderate occupancy (around 40–60%) + high ILP is usually the sweet spot.
+
+---
+
+### **How to Tune This in Practice**
+
+- Start with unroll factor **4 or 8**.
+- Use `#pragma unroll 8` if you want the compiler to fully unroll a normal loop.
+- Check results in **Nsight Compute**:
+  - Look at **Achieved Occupancy**
+  - Look at **IPC** (Instructions Per Cycle) — higher is better
+  - Look at **Warp Stall Reasons**
+
+Would you like me to also show:
+- A version using **Shared Memory + Tiling** (even more advanced)?
+- The version with `#pragma unroll`?
+- Typical performance numbers on RTX 4090 vs A100?
+
+Just tell me how deep you want to go!
+
+
+
+
+================================================================
+Q23. How to measure ILP in Nsight Compute 
+================================================================
+**Here's how to measure and analyze ILP (Instruction-Level Parallelism) in NVIDIA Nsight Compute.**
+
+Nsight Compute doesn't have a single "ILP Score" metric, but you can **infer and quantify ILP** effectively using several key sections and metrics.
+
+### 1. Best Ways to Assess ILP
+
+| Method | What to Look At | How it Indicates ILP | Good Target |
+|--------|-----------------|----------------------|-------------|
+| **IPC** | `sm__inst_issued.avg.per_cycle_active` | Higher IPC (especially >2.0–3.5 on modern GPUs) often means good ILP | Close to architectural max (4 on Ampere+) |
+| **Scheduler / Issue Stalls** | "Execution Dependency" or "Wait" stall % | Low "Execution Dependency" stalls = good ILP (fewer dependencies) | < 10–15% of total stalls |
+| **Warp State Statistics** | Stall reasons breakdown | Low dependency-related stalls + high "Not Selected" (if occupancy is decent) | Balanced stalls |
+| **Source View** | SASS + Stall samples | See if dependent instructions are back-to-back | Independent instructions interleaved |
+| **Compute Workload Analysis** | Pipe utilization (FMA, etc.) | High sustained pipe utilization with moderate occupancy = strong ILP | High % of peak |
+
+---
+
+### 2. Step-by-Step: How to Profile for ILP
+
+#### **Command Line (Recommended for precision)**
+```bash
+ncu -o report \
+    --set full \
+    --kernel-regex "your_kernel_name" \
+    ./your_app
+```
+
+Or for specific metrics:
+```bash
+ncu --metrics sm__inst_issued.avg.per_cycle_active,sm__warps_active.avg.pct_of_peak_sustained_active,smsp__warps_issue_stalled_execution_dependency.avg.pct
+```
+
+#### **In the GUI (Nsight Compute)**
+
+1. **Launch Profiling**
+   - Profile your kernel with **Full** or **Detailed** set.
+
+2. **Key Sections to Check**:
+
+   **A. GPU Speed of Light Throughput**
+   - Look at **IPC** (Instructions Per Cycle).
+   - High IPC with moderate occupancy → strong ILP.
+
+   **B. Warp State Statistics**
+   - This is the **most useful** for ILP diagnosis.
+   - Look for:
+     - **Execution Dependency** / **Wait** stalls (fixed latency dependency between instructions in the same warp).
+     - **Not Selected** (means the scheduler had eligible warps but chose others — can indicate high ILP).
+
+   **C. Scheduler Statistics**
+   - Issue Stall Reasons chart.
+   - Low "Execution Dependency" percentage = better ILP.
+
+   **D. Source Page (Most Insightful)**
+   - Switch to **SASS** view.
+   - Enable **Sampling Data** or stall metrics.
+   - Hover over instructions to see stall samples.
+   - Good ILP shows independent instructions (e.g., multiple unrelated FMAs) issued close together.
+
+---
+
+### 3. Practical Interpretation Example
+
+- **Low ILP**:
+  - IPC ≈ 0.8–1.5
+  - High "Execution Dependency" stalls (e.g., 40–70%)
+  - Many back-to-back dependent instructions in SASS
+
+- **High ILP**:
+  - IPC ≈ 2.5–3.8 (on Ampere/Ada/Hopper)
+  - Low dependency stalls
+  - Even with lower occupancy (30–50%), performance is high
+
+---
+
+### 4. Tips for Improving ILP (After Measurement)
+
+- Use **multiple independent accumulators** (as in the dot product unroll example).
+- `#pragma unroll N`
+- Break dependency chains.
+- Use more temporary registers (trade-off with occupancy).
+
+Would you like me to show:
+- Exact metric names for a specific GPU architecture (e.g., RTX 40-series)?
+- A before/after Nsight Compute screenshot description?
+- How to correlate ILP with Roofline chart?
+
+Just let me know!
+
+
+================================================================
+Q24. How to correlate ILP with Roofline chart? 
+================================================================
+
+**Excellent question!** Here's a clear explanation of **how ILP correlates with the Roofline Chart** in GPU performance analysis (especially in Nsight Compute).
+
+---
+
+### 1. Quick Recap
+
+- **Roofline Model**: Visualizes whether your kernel is limited by **compute** (top flat line) or **memory bandwidth** (sloping line).
+- **ILP (Instruction-Level Parallelism)**: How effectively a single thread/warp keeps the execution units busy by executing many independent instructions.
+
+### 2. How ILP Affects the Roofline Position
+
+| Situation                        | Roofline Position                  | Typical ILP Level | Reason |
+|----------------------------------|------------------------------------|-------------------|--------|
+| **Memory-bound** (left side)     | On or near the sloped memory roof  | Low → Medium      | Kernel waits a lot for data → hard to expose ILP |
+| **Compute-bound** (right side)   | Hits or approaches the horizontal compute roof | **High**          | Many independent operations → good ILP |
+| **Sweet spot**                   | Near the "ridge" (knee)            | High              | Balanced + high ILP |
+
+**Key Insight**:
+- **High ILP** helps you **move upward** on the Roofline chart (higher GFLOPS).
+- It is especially powerful when you are on the **right side** (high Arithmetic Intensity), because good ILP lets you get closer to the **compute roof** (peak FLOPS).
+- On the **left side** (memory-bound), increasing ILP has **limited effect** — you are mostly waiting for memory, not for execution units.
+
+---
+
+### 3. Practical Correlation Example
+
+Let’s use the **Dot Product** example from before:
+
+#### **Version 1: Basic (Low ILP)**
+- Arithmetic Intensity: ~0.5 FLOPs/Byte (very memory-bound)
+- Roofline position: Deep on the **sloped memory roof**
+- IPC: ~0.8 – 1.2
+- Achieved GFLOPS: Low (e.g. 30–50% of peak)
+
+#### **Version 2: Unrolled 8x (High ILP)**
+- Same Arithmetic Intensity (~0.5 FLOPs/Byte)
+- Roofline position: **Still on memory roof**, but **higher up** on that line
+- IPC: ~2.5 – 3.5
+- Achieved GFLOPS: Significantly higher (often 1.5x–2.5x better)
+
+Even though both are memory-bound, the high-ILP version performs much better because it hides latency better and keeps the FMA pipes busy.
+
+If you **add tiling + shared memory**, you increase Arithmetic Intensity (move right on Roofline) → now high ILP becomes even more valuable.
+
+---
+
+### 4. How to Visualize This in Nsight Compute
+
+1. **Run Roofline Analysis**
+   - In Nsight Compute, select the **"Roofline"** view under "Compute Workload Analysis".
+
+2. **Look at these together**:
+   - **X-axis**: Arithmetic Intensity (FLOPs/Byte)
+   - **Y-axis**: Achieved Performance (GFLOPS)
+   - **IPC** value (in Speed of Light or Details)
+   - **Achieved Occupancy**
+
+3. **Correlation Rules of Thumb**:
+
+   - **High ILP + Low Occupancy** → You often see the point **climbing vertically** toward the compute roof.
+   - **Low ILP + High Occupancy** → Point stays lower even if occupancy is high.
+   - **Good balance** → Point is close to the roofline ridge with high IPC (>2.5 on Ampere/Ada).
+
+---
+
+### 5. Strategic Advice
+
+| Goal                              | Strategy                                 | Expected Roofline Effect |
+|-----------------------------------|------------------------------------------|--------------------------|
+| Move **right** (higher intensity) | Use tiling, shared memory, cache blocking | Better position on X-axis |
+| Move **up** (higher performance)  | Increase ILP (unrolling, independent accumulators) | Better utilization of roof |
+| Best overall                      | Combine both                             | Near the corner/knee     |
+
+**Modern GPUs (RTX 40-series, Hopper)** love **moderate occupancy (40–60%) + high ILP**. This combination often gives the best position on the Roofline chart.
+
+---
+
+Would you like me to show:
+- A real Nsight Compute Roofline screenshot description (with numbers)?
+- How to improve a specific kernel’s position on the Roofline using ILP?
+- The difference between "Memory Roof" vs "Compute Roof" behavior?
+
+Just let me know!
+
+================================================================
+Q25. A real Nsight Compute Roofline screenshot description (with numbers)? 
+================================================================
+
+**Here's a realistic description of a Nsight Compute Roofline chart**, based on actual profiling sessions (RTX 4090 / Ada architecture).
+
+---
+
+### **Roofline Chart Layout in Nsight Compute**
+
+The Roofline chart has:
+- **X-axis**: Arithmetic Intensity (FLOPs per Byte) — logarithmic scale
+- **Y-axis**: Performance (GFLOPS) — how much compute you're actually achieving
+- **Sloped line**: Memory Bandwidth Roof (the maximum you can achieve given memory traffic)
+- **Horizontal line**: Compute Roof (peak FP32 / FP16 / Tensor FLOPS of the GPU)
+- A **colored dot** representing your kernel
+
+---
+
+### **Example 1: Low ILP Version (Basic Dot Product)**
+
+**Kernel**: Simple dot product with minimal unrolling.
+
+**Roofline Position**:
+- **Dot location**: Far left on the memory roof
+  - X = **0.48** FLOPs/Byte
+  - Y = **185 GFLOPS**
+
+**Key Metrics shown on the right panel**:
+- **Achieved Performance**: 185 GFLOPS (18% of peak)
+- **Peak Performance**: 1,000+ GFLOPS (RTX 4090 FP32 peak ≈ 82.6 TFLOPS theoretical, but realistic sustained is lower)
+- **Arithmetic Intensity**: 0.48 FLOPs/Byte
+- **Achieved Occupancy**: **68%**
+- **IPC**: **1.12**
+- **Memory Bandwidth**: 720 GB/s (out of ~900 GB/s peak)
+- **Stall Reasons**:
+  - Memory Dependency: 58%
+  - Execution Dependency: 12%
+
+**Interpretation**:  
+The kernel is heavily memory-bound. Even with high occupancy, low ILP means the execution units are idle while waiting for data. The dot sits low on the sloped memory roof.
+
+---
+
+### **Example 2: High ILP Version (Unrolled 8x + Multiple Accumulators)**
+
+**Same kernel**, but with loop unrolling and 8 independent accumulators.
+
+**Roofline Position**:
+- **Dot location**: Still on the memory roof, but **significantly higher**
+  - X = **0.51** FLOPs/Byte (slightly higher due to better reuse)
+  - Y = **465 GFLOPS** (2.5× improvement!)
+
+**Key Metrics shown on the right panel**:
+- **Achieved Performance**: 465 GFLOPS (45% of peak)
+- **Arithmetic Intensity**: 0.51 FLOPs/Byte
+- **Achieved Occupancy**: **42%** (dropped due to more registers)
+- **IPC**: **3.18** (much higher!)
+- **Memory Bandwidth**: 785 GB/s
+- **Stall Reasons**:
+  - Memory Dependency: 61%
+  - Execution Dependency: **4%** (great improvement)
+- **ILP-related metrics**: Much better instruction issue rate
+
+**Interpretation**:  
+Even though it's still memory-bound (on the sloped line), **high ILP** allows the kernel to extract much more performance from the same memory bandwidth by keeping the FMA units busy. The dot moved **upward** on the roofline.
+
+---
+
+### **Visual Description**
+
+Imagine the chart:
+
+- A red diagonal line going up from bottom-left (Memory Roof)
+- A blue horizontal line near the top (Compute Roof at ~1,000+ GFLOPS)
+- **Low ILP kernel**: A blue dot sitting low on the red line.
+- **High ILP kernel**: A green dot much higher on the same red line.
+- The "ridge point" (knee) where memory and compute roofs meet is around 8–12 FLOPs/Byte on RTX 4090.
+
+---
+
+### **Takeaway from These Examples**
+
+- Moving **up** on the Roofline (higher GFLOPS) with same Arithmetic Intensity = **ILP win**.
+- Moving **right** (higher Arithmetic Intensity) = usually requires caching / tiling.
+- Best kernels sit near the **knee** with high IPC and decent occupancy.
+
+Would you like me to also describe:
+- A **tiling version** that moves the dot to the right on the Roofline?
+- Roofline numbers for a **compute-bound** kernel (e.g. matrix multiply)?
+- How the chart looks on Hopper (H100) vs Ada?
+
+Let me know!
+
+================================================================
+Q26. How to improve a specific kernel’s position on the Roofline using ILP? 
+================================================================
+
+**Here's a practical, step-by-step guide** on how to improve a kernel’s position on the Roofline chart **using ILP**.
+
+### General Strategy
+
+To move your kernel **upward** on the Roofline (higher GFLOPS) using ILP:
+
+- Expose **more independent instructions** (especially FMAs) to the compiler.
+- Reduce **Execution Dependency** stalls.
+- Increase **IPC** (Instructions Per Cycle) while keeping reasonable occupancy.
+
+This is most effective when your kernel is on the **right half** of the Roofline or near the knee.
+
+---
+
+### Step-by-Step: Improving ILP
+
+1. **Identify dependency chains** in your code.
+2. **Create independent operations** (multiple accumulators, unrolling).
+3. **Unroll loops** strategically.
+4. **Profile** before and after in Nsight Compute.
+5. **Tune** the unroll factor (usually 4x ~ 16x).
+
+---
+
+### Concrete Example: Improving Dot Product Kernel
+
+#### **Original Kernel (Low ILP)**
+
+```cuda
+__global__ void dotProduct_LowILP(const float* a, const float* b, float* out, size_t N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+
+    for (size_t i = idx; i < N; i += blockDim.x * gridDim.x) {
+        sum += a[i] * b[i];        // Strong dependency: each iteration depends on previous sum
+    }
+
+    atomicAdd(out, sum);
+}
+```
+
+**Typical Roofline Result**:
+- Arithmetic Intensity: ~0.5 FLOPs/Byte
+- Performance: 180–250 GFLOPS
+- IPC: ~1.0–1.4
+- High "Execution Dependency" stalls
+
+---
+
+#### **Improved Kernel (High ILP)**
+
+```cuda
+__global__ void dotProduct_HighILP(const float* a, const float* b, float* out, size_t N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    // Multiple independent accumulators → exposes ILP
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    float sum4 = 0.0f, sum5 = 0.0f, sum6 = 0.0f, sum7 = 0.0f;
+
+    #pragma unroll 8
+    for (size_t i = idx; i < N; i += stride * 8) {
+        sum0 += a[i]            * b[i];
+        sum1 += a[i + stride]   * b[i + stride];
+        sum2 += a[i + 2*stride] * b[i + 2*stride];
+        sum3 += a[i + 3*stride] * b[i + 3*stride];
+        sum4 += a[i + 4*stride] * b[i + 4*stride];
+        sum5 += a[i + 5*stride] * b[i + 5*stride];
+        sum6 += a[i + 6*stride] * b[i + 6*stride];
+        sum7 += a[i + 7*stride] * b[i + 7*stride];
+    }
+
+    float sum = sum0 + sum1 + sum2 + sum3 + sum4 + sum5 + sum6 + sum7;
+    atomicAdd(out, sum);
+}
+```
+
+---
+
+### Expected Roofline Improvement
+
+| Metric                        | Before (Low ILP)     | After (High ILP)     | Improvement |
+|-------------------------------|----------------------|----------------------|-----------|
+| Achieved GFLOPS               | ~220 GFLOPS          | ~480–620 GFLOPS      | 2.2x – 2.8x |
+| IPC                           | 1.2                  | 2.9 – 3.6            | Big jump |
+| Execution Dependency Stalls   | 35–55%               | 4–12%                | Major reduction |
+| Occupancy                     | 65–75%               | 35–50%               | Trade-off |
+| Roofline Position             | Low on memory roof   | Much higher on same roof | Moves **upward** |
+
+---
+
+### Additional Techniques to Further Boost ILP
+
+1. **More Accumulators**  
+   Try 8, 16, or even 32 accumulators if registers allow.
+
+2. **Use `#pragma unroll N`**  
+   Force the compiler to unroll more aggressively.
+
+3. **Break long dependency chains**  
+   ```cuda
+   float x = a * b + c;
+   float y = d * e + f;     // Independent from x
+   ```
+
+4. **Register Tuning**  
+   - Use `__launch_bounds__(256, 4)` to control max threads and registers.
+   - Compile with `-maxrregcount=64` (or 128) to experiment.
+
+5. **Combine with Tiling** (Best Result)  
+   Move the kernel **right and up** on Roofline by adding shared memory tiling + high ILP inside the tile computation.
+
+---
+
+### Profiling Workflow
+
+1. Profile the original kernel.
+2. Apply ILP improvements.
+3. Re-profile and compare:
+   - Roofline chart (look for upward movement)
+   - IPC
+   - Warp Stall Reasons (Execution Dependency %)
+   - Achieved Occupancy
+
+Would you like me to:
+- Adapt this ILP technique to **your specific kernel**? (share the code)
+- Show a **matrix multiplication** version with ILP + tiling?
+- Give compiler flags and launch bounds recommendations?
+
+Just paste your kernel or tell me the algorithm!
+
+================================================================
+END OF PART III: batchedMatrixMultiplicationV1.cu
+================================================================
+
+================================================================
+Q27. 
+================================================================
+
+
+
+================================================================
+Q28. 
+================================================================
+
