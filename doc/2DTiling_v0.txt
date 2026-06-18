@@ -1,0 +1,791 @@
+================================================================================
+              2D TILED MATRIX MULTIPLICATION ON GPU: COMPLETE GUIDE
+                   All Questions, Explanations, Examples, Diagrams
+================================================================================
+
+UTF-8 Format | Created: 2026-06-16
+
+================================================================================
+LIST OF QUESTIONS AND TOPICS
+================================================================================
+
+Q1.  Does each thread execute the full loop (lines 12-13), or only line 13?
+Q2.  What does __syncthreads() do, and does it work on all threads in a block?
+Q3.  Does __syncthreads() explain why "q < Width/TILE_WIDTH" is the loop bound?
+Q4.  What does the formula subTileN[ty][tx] = N[(m*TILE_WIDTH+ty)*Width+Col] mean?
+Q5.  Is it always true that each tile of data is processed by one block?
+Q6.  Why does the first figure show M coalesced and N not, while figures 2 and 3
+     say the opposite?
+Q7.  Can you show a step-by-step thread/address table for naive vs tiled access?
+Q8.  Can you explain the full loading formulas with diagrams and examples?
+     subTileM[ty][tx] = M[(by*T + ty)*W + q*T + tx]
+     subTileN[ty][tx] = N[(q*T + ty)*W + (bx*T + tx)]
+
+TOPICS COVERED:
+  * CUDA thread hierarchy (threads, blocks, warps)
+  * Tiled matrix multiplication kernel walkthrough
+  * Shared memory (scratchpad), __syncthreads()
+  * Memory coalescing: what it is, when it happens, why it matters
+  * Tile loading formulas: M and N, row-major indexing
+  * Naive vs tiled global memory access patterns
+  * Output tile ownership per block
+  * Input tile iteration over q
+  * Full numeric examples with 4x4 matrices and T=2
+
+
+================================================================================
+REFERENCE KERNEL CODE
+================================================================================
+
+__global__ void MatrixMulKernel(float* M, float* N, float* P, int Width)
+{
+1.    __shared__ float subTileM[TILE_WIDTH][TILE_WIDTH];
+2.    __shared__ float subTileN[TILE_WIDTH][TILE_WIDTH];
+
+3.    int bx = blockIdx.x;   int by = blockIdx.y;
+4.    int tx = threadIdx.x;  int ty = threadIdx.y;
+
+      // Identify the row and column of the P element to work on
+5.    int Row = by * TILE_WIDTH + ty;
+6.    int Col = bx * TILE_WIDTH + tx;
+7.    float Pvalue = 0;
+
+      // Loop over M and N tiles required to compute the P element
+      // The code assumes that Width is a multiple of TILE_WIDTH!
+8.    for (int q = 0; q < Width/TILE_WIDTH; ++q) {
+          // Collaborative loading of M and N tiles into shared memory
+9.        subTileM[ty][tx] = M[Row*Width + q*TILE_WIDTH+tx];
+10.       subTileN[ty][tx] = N[(q*TILE_WIDTH+ty)*Width+Col];
+11.       __syncthreads();
+12.       for (int k = 0; k < TILE_WIDTH; ++k)
+13.           Pvalue += subTileM[ty][k] * subTileN[k][tx];
+14.       __syncthreads();
+15.   }
+16.   P[Row*Width+Col] = Pvalue;
+}
+
+
+================================================================================
+Q1. DOES EACH THREAD EXECUTE THE FULL LOOP (LINES 12-13), OR ONLY LINE 13?
+================================================================================
+
+ANSWER: Each thread executes the ENTIRE loop including line 12 (the for statement).
+Every thread runs its own private copy of the loop independently.
+
+EXPLANATION:
+
+The variable k is a LOCAL variable declared inside each thread's own stack frame.
+There is no sharing of k across threads. Each thread has:
+  * its own private k counter
+  * its own private Pvalue accumulator
+  * its own private loop that runs from 0 to TILE_WIDTH-1
+
+EXAMPLE: 4x4 matrix, TILE_WIDTH=2
+
+Thread (tx=0, ty=0) is computing P[0][0].
+After the tile is loaded into shared memory, that thread runs:
+
+  k=0:  Pvalue += subTileM[0][0] * subTileN[0][0]
+  k=1:  Pvalue += subTileM[0][1] * subTileN[1][0]
+
+Meanwhile, thread (tx=1, ty=0) is computing P[0][1] and runs ITS OWN loop:
+
+  k=0:  Pvalue += subTileM[0][0] * subTileN[0][1]
+  k=1:  Pvalue += subTileM[0][1] * subTileN[1][1]
+
+Both threads run the same loop structure (k=0 to TILE_WIDTH-1), but read
+different columns from subTileN[k][tx]. Each thread accumulates its own
+private Pvalue.
+
+KEY POINT:
+
+  Line 12:  for (int k = 0; k < TILE_WIDTH; ++k)   <- k is LOCAL per thread
+  Line 13:      Pvalue += subTileM[ty][k] * subTileN[k][tx];
+
+  k is declared locally so every thread has its own independent k.
+  Pvalue is also per-thread local. There is no sharing of partial sums.
+
+The loop computes the dot product of one row of the tile (from M) with one
+column of the tile (from N). That full dot product belongs to exactly one
+output element, owned by exactly one thread.
+
+SUMMARY DIAGRAM:
+
+  Thread (ty, tx)   owns output P[Row][Col]
+                    reads subTileM[ty][0..TILE_WIDTH-1]  (a full row)
+                    reads subTileN[0..TILE_WIDTH-1][tx]  (a full column)
+                    loops k=0..TILE_WIDTH-1 independently
+                    accumulates into its private Pvalue
+
+
+================================================================================
+Q2. WHAT DOES __syncthreads() DO? DOES IT WORK ON ALL THREADS IN A BLOCK?
+================================================================================
+
+ANSWER (Statement 1): TRUE. __syncthreads() is a BLOCK-LEVEL BARRIER.
+Every thread in the same block must reach the barrier before any thread in
+that block can proceed past it.
+
+ANSWER (Statement 2): TRUE. That is exactly why line 11 ensures all threads
+finish loading their tile element before any thread starts computing with it.
+
+EXAMPLE: 4x4 matrix, TILE_WIDTH=2, block has 4 threads: (0,0), (0,1), (1,0), (1,1)
+
+  Thread (0,0): loads subTileM[0][0] and subTileN[0][0]  ... arrives at line 11 early
+  Thread (0,1): loads subTileM[0][1] and subTileN[0][1]  ... arrives at line 11
+  Thread (1,0): loads subTileM[1][0] and subTileN[1][0]  ... arrives at line 11
+  Thread (1,1): loads subTileM[1][1] and subTileN[1][1]  ... arrives last
+
+         -------- ALL 4 MUST ARRIVE BEFORE ANY PROCEEDS --------
+
+  Thread (0,0): now safely reads subTileN[0][0] AND subTileN[1][0]
+                (written by threads (0,0) and (1,0) respectively)
+
+WITHOUT line 11, thread (0,0) might read subTileN[1][0] before thread (1,0)
+has written it. The sync guarantees the ENTIRE shared tile is fully populated
+before anyone starts computing.
+
+WHY line 14 is also needed:
+
+  After the k-loop completes, some threads may finish faster than others.
+  If one thread advances to the next q-iteration and starts overwriting
+  subTileM/subTileN before other threads finish reading them, data corruption
+  occurs. Line 14 prevents this: all threads must finish computing before
+  any thread loads the next tile.
+
+
+================================================================================
+Q3. DOES __syncthreads() EXPLAIN WHY "q < Width/TILE_WIDTH"?
+================================================================================
+
+ANSWER: FALSE. The loop bound has a completely different reason.
+
+__syncthreads() controls SAFETY of shared memory access.
+The loop bound controls MATHEMATICAL COMPLETENESS of the dot product.
+
+These are independent concerns.
+
+EXAMPLE: Width=4, TILE_WIDTH=2
+
+To compute one element of P, each thread needs a dot product across 4 elements:
+
+  P[0][0] = M[0][0]*N[0][0] + M[0][1]*N[1][0] + M[0][2]*N[2][0] + M[0][3]*N[3][0]
+             |___ q=0 covers cols 0..1 __|        |___ q=1 covers cols 2..3 __|
+
+The matrix has Width=4 columns, and each tile covers TILE_WIDTH=2 of them,
+so you need exactly 4/2 = 2 iterations to accumulate the full dot product.
+If you stopped at q=0 you would only have half the answer.
+
+  q=0:  Pvalue accumulates contribution from columns 0..1
+  q=1:  Pvalue accumulates contribution from columns 2..3
+        ---- now Pvalue is the complete dot product ----
+
+SUMMARY TABLE:
+
+  Statement                                         Correct?   Reason
+  ------------------------------------------------  --------   ------
+  __syncthreads() acts on all threads in a block    YES        Block-level barrier
+  Line 11 ensures all threads finish loading tile   YES        Consequence of above
+  q < Width/TILE_WIDTH is because of syncthreads    NO         Math: need all tiles
+                                                               to complete dot product
+
+
+================================================================================
+Q4. WHAT DOES THE FORMULA subTileN[ty][tx] = N[(m*TILE_WIDTH+ty)*Width+Col] MEAN?
+================================================================================
+
+The key insight is that M and N are loaded with DIFFERENT indexing patterns.
+M uses tx, N uses ty. Here is why.
+
+SETUP:
+
+  We want to compute P = M x N.
+  Each thread computes one output element P[Row][Col].
+  subTileM and subTileN hold a T x T block in shared memory.
+  Each thread loads exactly one element into each shared tile.
+
+FORMULA BREAKDOWN:
+
+  subTileN[ty][tx] = N[(m*TILE_WIDTH+ty)*Width+Col]
+
+  Rewriting with row-major indexing A[row*W + col] = A[row][col]:
+
+  N[(m*T + ty)*W + Col]   is the same as   N[m*T + ty][Col]
+
+  So:
+    row index = m*T + ty    (tile number * tile size + local row offset)
+    col index = Col         (the output column this thread owns)
+
+EXAMPLE (W=8, T=2, bx=0, by=0, q/m=1):
+
+  Thread (tx=0, ty=0): Col=0, row = 1*2+0=2  -> reads N[2][0] = N20
+  Thread (tx=1, ty=0): Col=1, row = 1*2+0=2  -> reads N[2][1] = N21
+  Thread (tx=0, ty=1): Col=0, row = 1*2+1=3  -> reads N[3][0] = N30
+  Thread (tx=1, ty=1): Col=1, row = 1*2+1=3  -> reads N[3][1] = N31
+
+  Result in shared memory:
+    subTileN[0][0]=N20  subTileN[0][1]=N21
+    subTileN[1][0]=N30  subTileN[1][1]=N31
+
+KEY DIFFERENCE between M and N loading:
+  * For M: uses tx -> each thread reads different COLUMNS
+  * For N: uses ty -> each thread reads different ROWS but same COLUMN
+  * This is because:
+    - M contributes COLUMNS to the dot product (changing with tx)
+    - N contributes ROWS to the dot product (changing with ty)
+    - P[row][col] = sum(M[row][:] * N[:][col]) requires this
+
+
+================================================================================
+Q5. IS IT ALWAYS TRUE THAT EACH TILE OF DATA IS PROCESSED BY ONE BLOCK?
+================================================================================
+
+YES for output tiles.   NO for input tiles.
+
+OUTPUT TILE TO BLOCK MAPPING (always 1:1):
+
+  gridDim.x = (Width / TILE_WIDTH)     // blocks in x (columns)
+  gridDim.y = (Width / TILE_WIDTH)     // blocks in y (rows)
+
+  Block (bx, by) computes output tile:
+    P[by*T : (by+1)*T, bx*T : (bx+1)*T]
+
+This is fixed and one-to-one.
+
+EXAMPLE with 4x4 matrix, T=2:
+
+  Block (0,0) -> computes P[0:2][0:2]      (top-left)
+  Block (1,0) -> computes P[0:2][2:4]      (top-right)
+  Block (0,1) -> computes P[2:4][0:2]      (bottom-left)
+  Block (1,1) -> computes P[2:4][2:4]      (bottom-right)
+
+Each block has a FIXED output region. No other block touches that output tile.
+
+INPUT TILE TO BLOCK MAPPING (1 block uses MULTIPLE input tiles):
+
+The SAME block processes DIFFERENT input tiles over time as it loops through q:
+
+  Block (bx=1, by=0) in q=0:
+    reads M tile: rows 0..1, cols 0..1
+    reads N tile: rows 0..1, cols 2..3
+
+  Block (bx=1, by=0) in q=1:
+    reads M tile: rows 0..1, cols 2..3    <- DIFFERENT input tile, SAME block
+    reads N tile: rows 2..3, cols 2..3
+
+SUMMARY TABLE:
+
+  Relationship                               Mapping   Always?
+  -----------------------------------------  -------   -------
+  One output tile -> one block               1:1       YES
+  One block -> one output tile               1:1       YES
+  One input tile -> one block                1:many    NO (multiple blocks share)
+  One block -> one input tile per iteration  1:1       YES (but changes each q)
+
+KEY INSIGHT: The block is "tied" to a specific output region. To compute
+that output tile it must iterate through MULTIPLE input tiles, one per q.
+
+
+================================================================================
+Q6. WHY DO FIGURES DISAGREE ON WHICH OF M AND N IS COALESCED?
+================================================================================
+
+SHORT ANSWER: The figures are describing DIFFERENT STAGES of the algorithm.
+
+  * Naive compute access (inside k-loop): M not coalesced, N coalesced
+  * Tiled load to shared memory: BOTH M and N coalesced
+  * Shared memory multiply: No coalescing needed (already in shared memory)
+
+WHAT IS MEMORY COALESCING?
+
+When a warp (32 threads) accesses memory simultaneously, the hardware can
+combine those 32 accesses into fewer transactions IF the addresses are
+contiguous. This is called coalescing. Non-contiguous addresses need one
+transaction each, wasting bandwidth.
+
+NAIVE VERSION: Inside the k-loop (compute phase)
+
+  Access formulas:
+    M:  M[Row*W + k]     <- Row differs by thread, k is the same
+    N:  N[k*W + Col]     <- k is same, Col differs by thread
+
+  For a warp, threads differ by tx (different Col values, same Row for M):
+
+    M: Thread 0 reads M[Row*W+k], Thread 1 reads M[Row*W+k], ...
+       ALL THREADS READ THE SAME ADDRESS (broadcast, not coalesced)
+       Even if Row differs per thread: M[0*W+k], M[0*W+k], M[1*W+k], M[1*W+k]
+       (strided, non-contiguous -> NOT coalesced)
+
+    N: Thread 0 reads N[k*W + base+0], Thread 1 reads N[k*W + base+1], ...
+       Addresses are base, base+1, base+2, base+3, ...  -> COALESCED
+
+  Result: M not coalesced, N coalesced.
+
+TILED VERSION: Global-to-shared load phase
+
+  Tiled load formulas (to fill shared memory):
+    subTileM[ty][tx] = M[Row*W + q*T + tx]
+    subTileN[ty][tx] = N[(q*T+ty)*W + Col], with Col = bx*T + tx
+
+  For a warp, threads vary by tx:
+
+    M addresses: Row*W + q*T + 0,  Row*W + q*T + 1, ...  -> CONTIGUOUS, coalesced
+    N addresses: (q*T+ty)*W + bx*T + 0,  + 1, ...        -> CONTIGUOUS, coalesced
+
+  Result: BOTH M and N are coalesced during tile loading!
+
+SUMMARY:
+
+  Stage                   M coalesced?   N coalesced?   Note
+  ----------------------  ------------   ------------   ----
+  Naive k-loop (global)   NO             YES            Original bad pattern
+  Tiled global load       YES            YES            Shared memory trick
+  Tiled k-loop (shared)   N/A            N/A            Shared memory, fast
+
+
+================================================================================
+Q7. STEP-BY-STEP THREAD/ADDRESS TABLE: NAIVE vs TILED
+================================================================================
+
+SETUP:
+
+  Matrices: 8x8, W=8
+  Tile size: T=2
+  Block (bx=0, by=0) computes output P[0:2][0:2]
+  4 threads:
+
+  Thread ID   (tx,ty)   Row   Col   Computes
+  ---------   -------   ---   ---   --------
+  0           (0,0)     0     0     P[0][0]
+  1           (1,0)     0     1     P[0][1]
+  2           (0,1)     1     0     P[1][0]
+  3           (1,1)     1     1     P[1][1]
+
+Matrices in memory (row-major, 0-indexed):
+
+  M (8x8 linear): M[0], M[1], ..., M[63]
+    M[r][c] = M[r*8+c]
+    Row 0: M[0..7]
+    Row 1: M[8..15]
+    ...
+
+  N (8x8): same layout
+
+NAIVE VERSION: Single iteration k=2
+
+  Formula: M[Row*Width + k]  and  N[k*Width + Col]
+
+  Thread ID   Row   Col   M address       M value   N address       N value
+  ---------   ---   ---   ---------       -------   ---------       -------
+  0           0     0     0*8+2 = 2       M[0][2]   2*8+0 = 16      N[2][0]
+  1           0     1     0*8+2 = 2       M[0][2]   2*8+1 = 17      N[2][1]
+  2           1     0     1*8+2 = 10      M[1][2]   2*8+0 = 16      N[2][0]
+  3           1     1     1*8+2 = 10      M[1][2]   2*8+1 = 17      N[2][1]
+
+  M addresses: 2, 2, 10, 10  -> scattered/broadcast -> NOT COALESCED
+  N addresses: 16, 17, 16, 17 -> contiguous within some pairs -> COALESCED
+
+TILED VERSION: Global-to-shared load for q=1
+
+  Formula:
+    subTileM[ty][tx] = M[Row*W + q*T + tx]  = M[(by*T + ty)*8 + 1*2 + tx]
+    subTileN[ty][tx] = N[(q*T+ty)*W + Col]  = N[(1*2 + ty)*8 + (bx*T + tx)]
+
+  With q=1, T=2, W=8, bx=0, by=0:
+
+  Loading M tile:
+
+  Thread ID   ty   tx   M row   M col       M address    M value
+  ---------   --   --   -----   -----       ---------    -------
+  0           0    0    0       1*2+0=2     0*8+2 = 2    M[0][2]
+  1           0    1    0       1*2+1=3     0*8+3 = 3    M[0][3]
+  2           1    0    1       1*2+0=2     1*8+2 = 10   M[1][2]
+  3           1    1    1       1*2+1=3     1*8+3 = 11   M[1][3]
+
+  M addresses: 2, 3, 10, 11  -> consecutive pairs -> COALESCED
+
+  Shared memory result:
+    subTileM[0][0]=M[0][2]  subTileM[0][1]=M[0][3]
+    subTileM[1][0]=M[1][2]  subTileM[1][1]=M[1][3]
+
+  Loading N tile:
+
+  Thread ID   ty   tx   N row       N col       N address    N value
+  ---------   --   --   -----       -----       ---------    -------
+  0           0    0    1*2+0=2     0*2+0=0     2*8+0 = 16   N[2][0]
+  1           0    1    1*2+0=2     0*2+1=1     2*8+1 = 17   N[2][1]
+  2           1    0    1*2+1=3     0*2+0=0     3*8+0 = 24   N[3][0]
+  3           1    1    1*2+1=3     0*2+1=1     3*8+1 = 25   N[3][1]
+
+  N addresses: 16, 17, 24, 25  -> consecutive pairs -> COALESCED
+
+  Shared memory result:
+    subTileN[0][0]=N[2][0]  subTileN[0][1]=N[2][1]
+    subTileN[1][0]=N[3][0]  subTileN[1][1]=N[3][1]
+
+MULTIPLY using shared memory (after sync):
+
+  for (int k = 0; k < TILE_WIDTH; ++k)
+      Pvalue += subTileM[ty][k] * subTileN[k][tx];
+
+  k=0:
+  Thread ID   ty   tx   subTileM[ty][0]   subTileN[0][tx]   Product
+  ---------   --   --   ---------------   ---------------   -------
+  0           0    0    M[0][2]           N[2][0]           M[0][2]*N[2][0]
+  1           0    1    M[0][2]           N[2][1]           M[0][2]*N[2][1]
+  2           1    0    M[1][2]           N[2][0]           M[1][2]*N[2][0]
+  3           1    1    M[1][2]           N[2][1]           M[1][2]*N[2][1]
+
+  k=1:
+  Thread ID   ty   tx   subTileM[ty][1]   subTileN[1][tx]   Product
+  ---------   --   --   ---------------   ---------------   -------
+  0           0    0    M[0][3]           N[3][0]           M[0][3]*N[3][0]
+  1           0    1    M[0][3]           N[3][1]           M[0][3]*N[3][1]
+  2           1    0    M[1][3]           N[3][0]           M[1][3]*N[3][0]
+  3           1    1    M[1][3]           N[3][1]           M[1][3]*N[3][1]
+
+FINAL COMPARISON TABLE:
+
+  Phase                   M addresses       N addresses       Coalescing
+  ----------------------  ----------------  ----------------  ----------
+  NAIVE k-loop (k=2)      2, 2, 10, 10      16, 17, 16, 17    M: NO  N: YES
+  TILED global load (q=1) 2, 3, 10, 11      16, 17, 24, 25    M: YES N: YES
+  TILED shared multiply   shared memory     shared memory     both fast
+
+
+================================================================================
+Q8. FULL EXPLANATION OF THE TILE LOADING FORMULAS
+================================================================================
+
+Formulas:
+  subTileM[ty][tx] = M[Row*Width + q*TILE_WIDTH + tx]
+                   = M[(by*T + ty)*W + q*T + tx]
+
+  subTileN[ty][tx] = N[(q*TILE_WIDTH+ty)*Width + Col]
+                   = N[(q*T + ty)*W + (bx*T + tx)]
+
+BIG PICTURE:
+
+  We want P = M x N.
+
+  For one output element:
+    P[row][col] = sum over k of M[row][k] * N[k][col]
+
+  A block computes a small square output tile of P (size T x T).
+  To get the full dot product, the block walks through q tile-pairs:
+    - q=0 covers cols 0..T-1 of M and rows 0..T-1 of N
+    - q=1 covers cols T..2T-1 of M and rows T..2T-1 of N
+    - q=n covers cols n*T...(n+1)*T-1 and rows n*T...(n+1)*T-1
+
+WHAT EACH SYMBOL MEANS:
+
+  T or TILE_WIDTH : tile size (e.g. 2, 4, 8, 16, 32)
+  bx, by          : block coordinates in the grid
+  tx, ty          : thread coordinates inside the block (0..T-1)
+  W or Width      : full matrix width
+  q               : current tile-pair iteration index
+
+  Derived:
+    Row = by*T + ty   (global row this thread outputs)
+    Col = bx*T + tx   (global col this thread outputs)
+
+WHAT THE BLOCK OWNS:
+
+  Block (bx=1, by=0) with T=2 computes the output tile:
+    P rows: 0, 1
+    P cols: 2, 3
+
+  because:
+    Row = by*T + ty = 0*2 + ty
+    Col = bx*T + tx = 1*2 + tx
+
+  Thread assignments:
+    (ty=0, tx=0) computes P[0][2]
+    (ty=0, tx=1) computes P[0][3]
+    (ty=1, tx=0) computes P[1][2]
+    (ty=1, tx=1) computes P[1][3]
+
+VISUAL LAYOUT (4x4 matrices, T=2):
+
+  M = 4x4                         N = 4x4                         P = 4x4
+
+  +----+----+----+----+           +----+----+----+----+           +----+----+----+----+
+  |M00 |M01 |M02 |M03 |           |N00 |N01 |N02 |N03 |           |P00 |P01 |P02 |P03 |
+  +----+----+----+----+           +----+----+----+----+           +----+----+----+----+
+  |M10 |M11 |M12 |M13 |           |N10 |N11 |N12 |N13 |           |P10 |P11 |P12 |P13 |
+  +----+----+----+----+           +----+----+----+----+           +----+----+----+----+
+  |M20 |M21 |M22 |M23 |           |N20 |N21 |N22 |N23 |           |P20 |P21 |P22 |P23 |
+  +----+----+----+----+           +----+----+----+----+           +----+----+----+----+
+  |M30 |M31 |M32 |M33 |           |N30 |N31 |N32 |N33 |           |P30 |P31 |P32 |P33 |
+  +----+----+----+----+           +----+----+----+----+           +----+----+----+----+
+
+  Block (bx=1, by=0) owns the top-right 2x2 output tile:
+    P[0][2], P[0][3], P[1][2], P[1][3]
+
+  To compute that tile, it needs:
+    q=0: rows 0..1 of M (cols 0..1) and rows 0..1 of N (cols 2..3)
+    q=1: rows 0..1 of M (cols 2..3) and rows 2..3 of N (cols 2..3)
+
+TILE ITERATION DIAGRAM (block bx=1, by=0, T=2, 4x4 matrix):
+
+  q=0:
+    M tile = rows 0..1, cols 0..1        N tile = rows 0..1, cols 2..3
+
+    +----+----+----+----+                +----+----+----+----+
+    |M00 |M01 |    |    |                |    |    |N02 |N03 |
+    +----+----+----+----+                +----+----+----+----+
+    |M10 |M11 |    |    |                |    |    |N12 |N13 |
+    +----+----+----+----+                +----+----+----+----+
+    |    |    |    |    |                |    |    |    |    |
+    +----+----+----+----+                +----+----+----+----+
+    |    |    |    |    |                |    |    |    |    |
+    +----+----+----+----+                +----+----+----+----+
+
+  q=1:
+    M tile = rows 0..1, cols 2..3        N tile = rows 2..3, cols 2..3
+
+    +----+----+----+----+                +----+----+----+----+
+    |    |    |M02 |M03 |                |    |    |    |    |
+    +----+----+----+----+                +----+----+----+----+
+    |    |    |M12 |M13 |                |    |    |    |    |
+    +----+----+----+----+                +----+----+----+----+
+    |    |    |    |    |                |    |    |N22 |N23 |
+    +----+----+----+----+                +----+----+----+----+
+    |    |    |    |    |                |    |    |N32 |N33 |
+    +----+----+----+----+                +----+----+----+----+
+
+FORMULA 1: LOADING M
+
+  subTileM[ty][tx] = M[Row*Width + q*TILE_WIDTH + tx]
+
+  In 2D notation: M[(by*T + ty)][q*T + tx]
+
+  This means:
+    row index = Row = by*T + ty   (thread's own output row)
+    col index = q*T + tx          (tile number q, offset by tx within tile)
+
+  So M is loaded HORIZONTALLY: walk across M row by row, advancing by tile.
+
+  M[row][col]:
+    row is FIXED by output row
+    col advances with q and tx
+
+FORMULA 2: LOADING N
+
+  subTileN[ty][tx] = N[(q*TILE_WIDTH+ty)*Width + Col]
+
+  In 2D notation: N[q*T + ty][bx*T + tx]
+
+  This means:
+    row index = q*T + ty          (tile number q, offset by ty within tile)
+    col index = Col = bx*T + tx   (thread's own output column)
+
+  So N is loaded VERTICALLY: walk down N column by column, advancing by tile.
+
+  N[row][col]:
+    row advances with q and ty
+    col is FIXED by output column
+
+WHY M USES tx BUT N USES ty:
+
+  For matrix multiply P = M x N:
+    P[row][col] = sum_k ( M[row][k] * N[k][col] )
+
+  To compute this sum:
+    * From M, we need a horizontal slice: row fixed, column varies with k
+      -> k corresponds to tx when loading (column index)
+    * From N, we need a vertical slice: row varies with k, column fixed
+      -> k corresponds to ty when loading (row index)
+
+  This is the FUNDAMENTAL REASON for the asymmetry.
+
+DETAILED THREAD-BY-THREAD EXAMPLE (W=4, T=2, bx=1, by=0):
+
+  Row = by*T + ty = 0 + ty
+  Col = bx*T + tx = 2 + tx
+
+  Thread   ty   tx   Row   Col   Computes
+  ------   --   --   ---   ---   --------
+  A        0    0    0     2     P[0][2]
+  B        0    1    0     3     P[0][3]
+  C        1    0    1     2     P[1][2]
+  D        1    1    1     3     P[1][3]
+
+M FORMULA EVALUATION FOR q=0 (q*T + tx = 0 + tx, Row*W + 0*2 + tx):
+
+  Thread   ty   tx   Row   M address       Formula result   M value
+  ------   --   --   ---   ---------       --------------   -------
+  A        0    0    0     0*4+0*2+0=0     M[0*4+0]=M[0]    M[0][0]
+  B        0    1    0     0*4+0*2+1=1     M[0*4+1]=M[1]    M[0][1]
+  C        1    0    1     1*4+0*2+0=4     M[1*4+0]=M[4]    M[1][0]
+  D        1    1    1     1*4+0*2+1=5     M[1*4+1]=M[5]    M[1][1]
+
+  Stored in shared memory:
+    subTileM[0][0]=M[0][0]  subTileM[0][1]=M[0][1]
+    subTileM[1][0]=M[1][0]  subTileM[1][1]=M[1][1]
+
+N FORMULA EVALUATION FOR q=0 (q*T + ty = 0 + ty, Col = 2+tx):
+
+  Thread   ty   tx   N row   N col   N address       N value
+  ------   --   --   -----   -----   ---------       -------
+  A        0    0    0       2       0*4+2=2         N[0][2]
+  B        0    1    0       3       0*4+3=3         N[0][3]
+  C        1    0    1       2       1*4+2=6         N[1][2]
+  D        1    1    1       3       1*4+3=7         N[1][3]
+
+  Stored in shared memory:
+    subTileN[0][0]=N[0][2]  subTileN[0][1]=N[0][3]
+    subTileN[1][0]=N[1][2]  subTileN[1][1]=N[1][3]
+
+MULTIPLY STEP FOR q=0:
+
+  k=0:
+    A: subTileM[0][0]*subTileN[0][0] = M[0][0]*N[0][2]
+    B: subTileM[0][0]*subTileN[0][1] = M[0][0]*N[0][3]
+    C: subTileM[1][0]*subTileN[0][0] = M[1][0]*N[0][2]
+    D: subTileM[1][0]*subTileN[0][1] = M[1][0]*N[0][3]
+
+  k=1:
+    A: subTileM[0][1]*subTileN[1][0] = M[0][1]*N[1][2]
+    B: subTileM[0][1]*subTileN[1][1] = M[0][1]*N[1][3]
+    C: subTileM[1][1]*subTileN[1][0] = M[1][1]*N[1][2]
+    D: subTileM[1][1]*subTileN[1][1] = M[1][1]*N[1][3]
+
+M FORMULA EVALUATION FOR q=1 (q*T + tx = 2 + tx):
+
+  Thread   ty   tx   Row   M address       M value
+  ------   --   --   ---   ---------       -------
+  A        0    0    0     0*4+1*2+0=2     M[0][2]
+  B        0    1    0     0*4+1*2+1=3     M[0][3]
+  C        1    0    1     1*4+1*2+0=6     M[1][2]
+  D        1    1    1     1*4+1*2+1=7     M[1][3]
+
+N FORMULA EVALUATION FOR q=1 (q*T + ty = 2 + ty):
+
+  Thread   ty   tx   N row   N col   N address   N value
+  ------   --   --   -----   -----   ---------   -------
+  A        0    0    2       2       2*4+2=10    N[2][2]
+  B        0    1    2       3       2*4+3=11    N[2][3]
+  C        1    0    3       2       3*4+2=14    N[3][2]
+  D        1    1    3       3       3*4+3=15    N[3][3]
+
+MULTIPLY STEP FOR q=1:
+
+  A: M[0][2]*N[2][2] + M[0][3]*N[3][2]
+  B: M[0][2]*N[2][3] + M[0][3]*N[3][3]
+  C: M[1][2]*N[2][2] + M[1][3]*N[3][2]
+  D: M[1][2]*N[2][3] + M[1][3]*N[3][3]
+
+FINAL RESULT:
+
+  Thread A computes P[0][2] = M[0][0]*N[0][2] + M[0][1]*N[1][2]
+                            + M[0][2]*N[2][2] + M[0][3]*N[3][2]
+                          = row 0 of M  dot  col 2 of N   (CORRECT!)
+
+  Thread B computes P[0][3] = M[0][0]*N[0][3] + M[0][1]*N[1][3]
+                            + M[0][2]*N[2][3] + M[0][3]*N[3][3]
+                          = row 0 of M  dot  col 3 of N   (CORRECT!)
+
+ADDRESS VIEW: ROW-MAJOR FLATTENING
+
+  In row-major storage:
+    A[row][col]  <=>  A[row*W + col]
+
+  So:
+    M[(by*T + ty)*W + q*T + tx]  means  M[row=by*T+ty][col=q*T+tx]
+    N[(q*T + ty)*W + (bx*T+tx)]  means  N[row=q*T+ty][col=bx*T+tx]
+
+FORMULA ANNOTATION:
+
+  subTileM[ty][tx] = M[(by*T + ty)*W + q*T + tx]
+                            ^                ^
+                   row = output row   col = tile offset + local col
+
+  subTileN[ty][tx] = N[(q*T + ty)*W + (bx*T + tx)]
+                          ^                 ^
+                 row = tile offset     col = output col
+                     + local row
+
+WHAT TO REMEMBER:
+
+  1. by and ty decide which row of M to load
+  2. bx and tx decide which column of N to load
+  3. q decides which tile-pair we are loading this iteration
+  4. M is loaded as M[output_row][q-tile-col]
+  5. N is loaded as N[q-tile-row][output_col]
+
+ONE-LINE INTUITION:
+
+  subTileM[ty][tx] loads the element at the thread's ROW from M's current tile
+  subTileN[ty][tx] loads the element at the thread's COL from N's current tile
+
+
+================================================================================
+OVERALL ALGORITHM FLOW DIAGRAM
+================================================================================
+
+For one block (bx, by) with T threads per side:
+
+  Step 1: Determine output region
+          Row = by*T + ty
+          Col = bx*T + tx
+
+  Step 2: Loop q from 0 to Width/T - 1
+            Step 2a: Load tile from M
+                     subTileM[ty][tx] = M[Row*W + q*T + tx]
+
+            Step 2b: Load tile from N
+                     subTileN[ty][tx] = N[(q*T+ty)*W + Col]
+
+            Step 2c: __syncthreads()
+                     (all threads must finish loading before computing)
+
+            Step 2d: Compute partial dot product
+                     for k = 0 to T-1:
+                       Pvalue += subTileM[ty][k] * subTileN[k][tx]
+
+            Step 2e: __syncthreads()
+                     (all threads must finish computing before next load)
+
+  Step 3: Write result
+          P[Row*W + Col] = Pvalue
+
+
+================================================================================
+PERFORMANCE BENEFIT SUMMARY
+================================================================================
+
+WHY TILING HELPS:
+
+  Without tiling:
+    * Each output element reads Width values from M and Width values from N
+    * These reads go to global memory (slow, ~400-800 cycles latency)
+    * Reads are not coalesced for M (wasted bandwidth)
+    * Total global memory reads per block: T*T*2*Width
+
+  With tiling:
+    * Each tile is loaded once to shared memory (fast, ~4-8 cycles)
+    * All T*T threads in the block reuse those shared values
+    * Each global value is read once per block, then reused T times
+    * Memory access reduction ratio: T (each element read once, reused T times)
+
+  REUSE FACTOR = TILE_WIDTH (T)
+
+  For T=16:  16x fewer global memory reads
+  For T=32:  32x fewer global memory reads (theoretical max on most GPUs)
+
+COMBINED WITH COALESCING:
+
+  Tiled global load makes BOTH M and N reads contiguous within a warp.
+  This means the GPU can combine T reads into one cache line transaction.
+  The combination of tiling + coalescing typically gives 5-10x speedup
+  over the naive version on real GPUs.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+
+Generated: 2026-06-16
+Encoding: UTF-8
+Source: Tiled Matrix Multiplication (CUDA), David Kirk/NVIDIA and Wen-mei W. Hwu, 2007-2018
