@@ -1,0 +1,417 @@
+Parallel Scan and Prefix Sum Notes (v0)
+
+Questions and Topics List (at the beginning)
+1) Brent-Kung Parallel Scan Step: what is it and why it exists
+2) Inclusive vs Exclusive scan definitions
+3) Detailed example with numbers: [3, 1, 7, 0, 4, 1, 6, 3]
+4) Reduction tree (up-sweep) and distribution tree (down-sweep)
+5) Stage-by-stage tables for indices, strides, and updates
+6) Diagram-style explanation of data movement
+7) Why exclusive scan is useful for offsets and addresses
+8) Why atomicAdd(global_counter, sizes[tid]) can be slow
+9) Exclusive scan vs atomic reservation: correctness and performance
+10) Practical code (Python and CUDA-style pseudocode)
+11) Common mistakes and quick checks
+
+============================================================
+Part 0. Starting from the very beginning
+============================================================
+Original core question:
+"Brent-Kung Parallel Scan Step, I don't understand this, please use detailed examples, diagram, chart, tables to explain."
+
+Short answer:
+- A scan computes prefix results.
+- Brent-Kung is one efficient parallel structure to compute scan.
+- It works in two phases:
+  Phase A: build partial sums upward (reduction / up-sweep)
+  Phase B: distribute needed prefixes downward (post-scan / down-sweep)
+
+Why people use it:
+- Good parallel depth (log2(n) style stages)
+- Work-efficient compared with very dense scan networks
+- Good balance for GPU shared-memory kernels
+
+
+============================================================
+Part 1. Definitions
+============================================================
+Given input x[0..n-1] and associative operator op (for example, +):
+
+Inclusive scan:
+- out[i] = x[0] op x[1] op ... op x[i]
+- For addition, out[i] = sum of elements up to and including i
+
+Exclusive scan:
+- out[i] = identity op x[0] op x[1] op ... op x[i-1]
+- For addition, identity is 0
+- So out[0] = 0
+
+Example with addition:
+Input:     [3, 1, 7, 0, 4, 1, 6, 3]
+Inclusive: [3, 4, 11, 11, 15, 16, 22, 25]
+Exclusive: [0, 3, 4, 11, 11, 15, 16, 22]
+
+Conversion rules for addition:
+- inclusive[i] = exclusive[i] + input[i]
+- exclusive[0] = 0
+- exclusive[i] = inclusive[i-1] for i > 0
+
+
+============================================================
+Part 2. Brent-Kung Parallel Scan (detailed example)
+============================================================
+We will use input T:
+T = [3, 1, 7, 0, 4, 1, 6, 3]
+Index: 0  1  2  3  4  5  6  7
+
+Brent-Kung has two major phases:
+1) Reduction (up-sweep): create larger partial sums
+2) Distribution (down-sweep/post-scan): fill missing prefixes
+
+------------------------------------------------------------
+2.1 Diagram-style data view (conceptual)
+------------------------------------------------------------
+Up-sweep idea for n=8:
+
+Level stride=1:
+(0,1), (2,3), (4,5), (6,7)
+
+Level stride=2:
+(1,3), (5,7)
+
+Level stride=4:
+(3,7)
+
+So partial sums grow like this:
+- index 1 gets sum(0..1)
+- index 3 gets sum(0..3)
+- index 5 gets sum(4..5)
+- index 7 gets sum(0..7) final total
+
+Then down-sweep distributes left-prefix information to right-side nodes.
+
+
+------------------------------------------------------------
+2.2 Reduction step table (up-sweep)
+------------------------------------------------------------
+Rule used at each stride s:
+- index = (thread + 1) * (2*s) - 1
+- T[index] = T[index] + T[index - s]
+
+Initial:
+T = [3, 1, 7, 0, 4, 1, 6, 3]
+
+Stride s=1:
+- T[1] += T[0]  -> 1 + 3 = 4
+- T[3] += T[2]  -> 0 + 7 = 7
+- T[5] += T[4]  -> 1 + 4 = 5
+- T[7] += T[6]  -> 3 + 6 = 9
+Result:
+T = [3, 4, 7, 7, 4, 5, 6, 9]
+
+Stride s=2:
+- T[3] += T[1]  -> 7 + 4 = 11
+- T[7] += T[5]  -> 9 + 5 = 14
+Result:
+T = [3, 4, 7, 11, 4, 5, 6, 14]
+
+Stride s=4:
+- T[7] += T[3]  -> 14 + 11 = 25
+Result:
+T = [3, 4, 7, 11, 4, 5, 6, 25]
+
+At this point:
+- T[7] is total sum of all inputs (25)
+- Some internal nodes hold useful block-prefix partial sums
+
+
+------------------------------------------------------------
+2.3 Inclusive post-scan distribution table (down-sweep style used in slides)
+------------------------------------------------------------
+Rule used:
+- stride starts from block_size/2 and halves
+- index = (thread + 1) * (2*stride) - 1
+- if index + stride < n:
+    T[index + stride] += T[index]
+
+Start from reduction output:
+T = [3, 4, 7, 11, 4, 5, 6, 25]
+
+Stride s=2:
+Possible indices: 3, 7
+- index=3 -> index+2=5 valid, so T[5] += T[3] -> 5 + 11 = 16
+- index=7 -> index+2=9 invalid
+Result:
+T = [3, 4, 7, 11, 4, 16, 6, 25]
+
+Stride s=1:
+Possible indices: 1,3,5,7
+- index=1 -> T[2] += T[1] -> 7 + 4 = 11
+- index=3 -> T[4] += T[3] -> 4 + 11 = 15
+- index=5 -> T[6] += T[5] -> 6 + 16 = 22
+- index=7 -> index+1=8 invalid
+Result:
+T = [3, 4, 11, 11, 15, 16, 22, 25]
+
+This is the inclusive scan output.
+
+
+------------------------------------------------------------
+2.4 Quick chart of active work per stage
+------------------------------------------------------------
+For n=8:
+
+Reduction:
+- stride 1: 4 updates
+- stride 2: 2 updates
+- stride 4: 1 update
+
+Distribution:
+- stride 2: 1 useful update (for this shape)
+- stride 1: 3 useful updates
+
+This staged pattern is why synchronization is required between stages.
+
+
+============================================================
+Part 3. Inclusive vs Exclusive (clear side-by-side)
+============================================================
+Input:
+[3, 1, 7, 0, 4, 1, 6, 3]
+
+Table:
+Index | Input | Inclusive | Exclusive
+0     | 3     | 3         | 0
+1     | 1     | 4         | 3
+2     | 7     | 11        | 4
+3     | 0     | 11        | 11
+4     | 4     | 15        | 11
+5     | 1     | 16        | 15
+6     | 6     | 22        | 16
+7     | 3     | 25        | 22
+
+Observation:
+- Exclusive is inclusive shifted right by one, with identity at index 0.
+
+
+============================================================
+Part 4. Why exclusive scan is useful (offsets/addresses)
+============================================================
+Scenario:
+Each thread wants to write variable-size output.
+Sizes per thread:
+sizes = [2, 5, 3, 4]
+
+Need:
+- Thread 0 writes 2 items
+- Thread 1 writes 5 items
+- Thread 2 writes 3 items
+- Thread 3 writes 4 items
+
+Question:
+Where does each thread start writing in one contiguous output buffer?
+
+Compute exclusive scan of sizes:
+exclusive(sizes) = [0, 2, 7, 10]
+
+Meaning:
+Thread | size | start offset | writes indices
+0      | 2    | 0            | 0..1
+1      | 5    | 2            | 2..6
+2      | 3    | 7            | 7..9
+3      | 4    | 10           | 10..13
+
+This gives conflict-free ranges directly.
+No overlap. No guessing.
+
+
+============================================================
+Part 5. Why not just use atomicAdd for offsets?
+============================================================
+You may see code like:
+
+    my_offset = atomicAdd(&global_output_index, sizes[tid]);
+
+It is correct for allocating unique ranges, but can be slow at scale.
+
+Reason:
+- All threads contend for one global counter address.
+- Atomic operations serialize access to that hotspot.
+- As concurrency grows, waiting grows.
+
+Example with sizes [2,5,3,4], initial counter=0:
+Assume service order by hardware is thread 2,0,3,1:
+
+Order | Thread | size | returned offset | counter after
+1     | 2      | 3    | 0               | 3
+2     | 0      | 2    | 3               | 5
+3     | 3      | 4    | 5               | 9
+4     | 1      | 5    | 9               | 14
+
+Correct, but this offset phase is bottlenecked by one location.
+
+With exclusive scan:
+- offsets are computed in structured parallel steps
+- each thread writes using offsets[tid]
+- no global per-item atomic reservation hotspot
+
+
+============================================================
+Part 6. Code examples
+============================================================
+
+------------------------------------------------------------
+6.1 Simple Python exclusive scan (addition)
+------------------------------------------------------------
+
+```python
+def exclusive_scan_add(x):
+    out = [0] * len(x)
+    running = 0
+    for i, v in enumerate(x):
+        out[i] = running
+        running += v
+    return out
+
+x = [3, 1, 7, 0, 4, 1, 6, 3]
+print(exclusive_scan_add(x))
+# [0, 3, 4, 11, 11, 15, 16, 22]
+```
+
+
+------------------------------------------------------------
+6.2 Stream compaction style example (GPU pattern in Python)
+------------------------------------------------------------
+
+```python
+def exclusive_scan_add(x):
+    out = [0] * len(x)
+    running = 0
+    for i, v in enumerate(x):
+        out[i] = running
+        running += v
+    return out
+
+def compact_nonzero(arr):
+    # 1 means keep, 0 means discard
+    flags = [1 if v != 0 else 0 for v in arr]
+    offsets = exclusive_scan_add(flags)
+    out = [None] * sum(flags)
+
+    for i, v in enumerate(arr):
+        if flags[i] == 1:
+            out[offsets[i]] = v
+    return flags, offsets, out
+
+arr = [5, 0, 3, 0, 0, 7, 2, 0, 1]
+flags, offsets, out = compact_nonzero(arr)
+print('arr    =', arr)
+print('flags  =', flags)
+print('offsets=', offsets)
+print('out    =', out)
+# out = [5, 3, 7, 2, 1]
+```
+
+
+------------------------------------------------------------
+6.3 CUDA-style pseudocode: atomic reservation (contention risk)
+------------------------------------------------------------
+
+```cpp
+__global__ void reserve_with_atomic(const int* sizes, int* offsets, int* counter, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    // Correct but potentially slow hotspot
+    offsets[tid] = atomicAdd(counter, sizes[tid]);
+}
+```
+
+
+------------------------------------------------------------
+6.4 CUDA-style pseudocode: scan-based writing
+------------------------------------------------------------
+
+```cpp
+// Assume offsets[] already computed by exclusive scan of sizes[]
+__global__ void write_payload(const int* sizes, const int* offsets, const float* input, float* output, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+
+    int start = offsets[tid];
+    int count = sizes[tid];
+
+    for (int j = 0; j < count; ++j) {
+        output[start + j] = input[start + j];
+    }
+}
+```
+
+
+------------------------------------------------------------
+6.5 Kernel-style loops shown in the lecture slides
+------------------------------------------------------------
+Reduction step (up-sweep):
+
+```cpp
+int stride = 1;
+while (stride < 2 * BLOCK_SIZE) {
+    __syncthreads();
+    int index = (threadIdx.x + 1) * stride * 2 - 1;
+    if (index < 2 * BLOCK_SIZE && (index - stride) >= 0) {
+        T[index] += T[index - stride];
+    }
+    stride *= 2;
+}
+```
+
+Post-scan distribution step:
+
+```cpp
+int stride = BLOCK_SIZE / 2;
+while (stride > 0) {
+    __syncthreads();
+    int index = (threadIdx.x + 1) * stride * 2 - 1;
+    if ((index + stride) < 2 * BLOCK_SIZE) {
+        T[index + stride] += T[index];
+    }
+    stride /= 2;
+}
+```
+
+
+============================================================
+Part 7. Common confusion points and answers
+============================================================
+Q1) Why are there two trees/phases?
+A1) Up-sweep computes bigger partial sums; down-sweep distributes prefix context to missing nodes.
+
+Q2) Why not update everything in one pass?
+A2) Dependencies prevent that. Later updates require results from earlier stages.
+
+Q3) Why sync between stages?
+A3) Because each stage reads values produced by the previous stage; without sync, threads may read stale data.
+
+Q4) Why exclusive scan for addresses?
+A4) Because exclusive directly gives start positions for each thread's output region.
+
+Q5) Is atomicAdd always bad?
+A5) Not always. It is often fine for small contention. It becomes a bottleneck when many threads hit the same counter.
+
+Q6) Can inclusive and exclusive be converted?
+A6) Yes. For addition, they are a one-position shift apart (with identity inserted at the front).
+
+
+============================================================
+Part 8. Practical summary
+============================================================
+- Brent-Kung scan is a structured parallel prefix method with two phases.
+- Inclusive scan gives prefix including current element.
+- Exclusive scan gives prefix before current element.
+- Exclusive scan is extremely useful for offsets, addresses, compaction, and variable-length writes.
+- Replacing per-thread global atomic reservation with scan-based offsets usually improves scalability.
+
+
+============================================================
+End of notes
+============================================================
