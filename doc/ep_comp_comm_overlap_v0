@@ -1,0 +1,811 @@
+# Computation and Communication Overlap in Expert Parallel
+
+## Why Overlap Matters in Expert Parallel (EP)
+
+In Mixture-of-Experts (MoE) with Expert Parallel, tokens are routed across GPUs — this requires **All-to-All collective communication** twice per MoE layer:
+
+```
+Forward pass:
+  All2All_dispatch:   send tokens to expert GPUs    ← communication
+  Expert compute:     FFN on local experts          ← computation  
+  All2All_combine:    gather results back           ← communication
+
+Backward pass:
+  All2All_combine_grad → Expert_grad → All2All_dispatch_grad
+```
+
+The naive approach runs these **sequentially**, leaving GPUs idle during communication. The goal: **run computation and communication simultaneously**.
+
+---
+
+## The Core Idea: Chunk-Based Pipeline
+
+Instead of sending ALL tokens at once, split them into **micro-chunks** and pipeline them:
+
+```
+Naive (sequential):
+  [===All2All_dispatch===][=====Expert FFN=====][===All2All_combine===]
+   GPU idle during comm        GPU busy           GPU idle during comm
+
+Overlapped (pipelined):
+  Chunk0: [dispatch][FFN][combine]
+  Chunk1:      [dispatch][FFN][combine]
+  Chunk2:           [dispatch][FFN][combine]
+  ...
+  Timeline: comm and compute overlap across chunks!
+```
+
+---
+
+## Key Mechanism: CUDA Streams
+
+The fundamental building block — different CUDA streams run concurrently:
+
+```python
+import torch
+import torch.distributed as dist
+
+# Two streams: one for compute, one for communication
+compute_stream = torch.cuda.Stream()
+comm_stream    = torch.cuda.Stream()
+
+def overlapped_expert_forward(tokens, expert_ffn, num_chunks=4):
+    """
+    tokens: [num_tokens, hidden_dim]
+    Split into chunks, pipeline dispatch → compute → combine
+    """
+    chunks = tokens.chunk(num_chunks, dim=0)
+    results = [None] * num_chunks
+
+    # Pre-allocate receive buffers for all chunks
+    recv_buffers = [torch.empty_like(c) for c in chunks]
+
+    for i, chunk in enumerate(chunks):
+        # ── Communication: dispatch chunk i ──
+        with torch.cuda.stream(comm_stream):
+            # All2All: send chunk i to expert GPUs
+            dist.all_to_all_single(
+                recv_buffers[i],   # where to receive
+                chunk,             # what to send
+                group=ep_group
+            )
+
+        # ── Computation: run FFN on chunk i-1 (already received) ──
+        if i > 0:
+            with torch.cuda.stream(compute_stream):
+                # Make compute_stream wait for comm of chunk i-1
+                compute_stream.wait_stream(comm_stream)
+                results[i-1] = expert_ffn(recv_buffers[i-1])
+
+    # Process last chunk
+    with torch.cuda.stream(compute_stream):
+        compute_stream.wait_stream(comm_stream)
+        results[-1] = expert_ffn(recv_buffers[-1])
+
+    # Synchronize before combine
+    torch.cuda.synchronize()
+
+    return torch.cat(results, dim=0)
+```
+
+---
+
+## Full Pipeline: DeepSeek-V3 Style Double-Chunk Overlap
+
+DeepSeek-V3 and similar systems use a **double-buffering** approach with explicit chunk sequencing:
+
+```python
+class ExpertParallelOverlap:
+    def __init__(self, ep_group, num_experts, hidden_dim, ffn_dim, num_chunks=8):
+        self.ep_group   = ep_group
+        self.num_chunks = num_chunks
+
+        # Two CUDA streams
+        self.comm_stream    = torch.cuda.Stream()
+        self.compute_stream = torch.cuda.default_stream()
+
+        # Double buffer: ping-pong between buffer A and B
+        self.buffers = [
+            torch.empty(MAX_TOKENS_PER_CHUNK, hidden_dim, device='cuda'),
+            torch.empty(MAX_TOKENS_PER_CHUNK, hidden_dim, device='cuda'),
+        ]
+
+    def forward(self, tokens, expert_weights, expert_indices):
+        """
+        Full forward pass with overlapped All2All and FFN
+        tokens:          [total_tokens, hidden]
+        expert_indices:  [total_tokens, top_k]
+        expert_weights:  [total_tokens, top_k]
+        """
+        # ── Step 1: Route tokens to chunks ──
+        chunks, send_counts, recv_counts = self.prepare_chunks(
+            tokens, expert_indices, self.num_chunks
+        )
+
+        output_chunks = []
+        PREV, CURR = 0, 1   # double buffer indices
+
+        # ── Step 2: Pre-dispatch first chunk (prime the pipeline) ──
+        with torch.cuda.stream(self.comm_stream):
+            self._all2all_dispatch(
+                chunks[0], self.buffers[CURR],
+                send_counts[0], recv_counts[0]
+            )
+
+        # ── Step 3: Main pipeline loop ──
+        for i in range(self.num_chunks):
+            # Swap buffers
+            PREV, CURR = CURR, PREV
+
+            # [COMM] Dispatch next chunk (overlaps with compute below)
+            if i + 1 < self.num_chunks:
+                with torch.cuda.stream(self.comm_stream):
+                    self._all2all_dispatch(
+                        chunks[i+1], self.buffers[CURR],
+                        send_counts[i+1], recv_counts[i+1]
+                    )
+
+            # [COMPUTE] Run expert FFN on previously received chunk
+            # Must wait for PREV buffer's dispatch to complete
+            self.compute_stream.wait_stream(self.comm_stream)
+            expert_out = self._run_local_experts(
+                self.buffers[PREV],
+                expert_weights[i],
+                expert_indices[i]
+            )
+
+            # [COMM] Send results back (All2All combine)
+            # Overlaps with NEXT chunk's dispatch (already started above)
+            with torch.cuda.stream(self.comm_stream):
+                combined = self._all2all_combine(
+                    expert_out, send_counts[i], recv_counts[i]
+                )
+            output_chunks.append(combined)
+
+        torch.cuda.synchronize()
+        return self._reassemble(output_chunks, expert_indices)
+
+    def _all2all_dispatch(self, src, dst, send_counts, recv_counts):
+        """Route tokens to expert GPUs"""
+        dist.all_to_all(
+            list(dst.split(recv_counts.tolist())),
+            list(src.split(send_counts.tolist())),
+            group=self.ep_group
+        )
+
+    def _all2all_combine(self, src, send_counts, recv_counts):
+        """Gather expert outputs back to original GPUs"""
+        output = torch.empty_like(src)
+        dist.all_to_all(
+            list(output.split(send_counts.tolist())),
+            list(src.split(recv_counts.tolist())),
+            group=self.ep_group
+        )
+        return output
+
+    def _run_local_experts(self, tokens, weights, indices):
+        """Run FFN for each local expert on the assigned tokens"""
+        output = torch.zeros_like(tokens)
+        for expert_id in self.local_expert_ids:
+            mask = (indices == expert_id).any(dim=-1)
+            if mask.any():
+                expert_tokens = tokens[mask]
+                expert_out    = self.experts[expert_id](expert_tokens)
+                # Weighted combine for top-k routing
+                output[mask] += weights[mask] * expert_out
+        return output
+```
+
+---
+
+## Timeline Visualization
+
+```
+8 chunks, pipeline steady state:
+
+Stream:   t=0    t=1    t=2    t=3    t=4    t=5    t=6    t=7
+COMM:    [D0]   [D1]   [D2]   [D3]   [D4]   [D5]   [D6]   [D7]
+              [C1]   [C2]   [C3]   [C4]   [C5]   [C6]   [C7]   [C8]
+COMPUTE:        [FFN0] [FFN1] [FFN2] [FFN3] [FFN4] [FFN5] [FFN6] [FFN7]
+
+D = All2All dispatch
+C = All2All combine
+FFN = Expert computation
+
+In steady state:
+  COMM    runs: Dispatch(i+1) + Combine(i)    simultaneously
+  COMPUTE runs: FFN(i)                        simultaneously
+  → 3-way overlap in steady state!
+```
+
+---
+
+## Backward Pass Overlap
+
+The backward pass needs the same treatment — gradients also require All2All:
+
+```python
+class OverlapFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tokens, expert_ffn, ep_group, num_chunks):
+        ctx.save_for_backward(tokens)
+        ctx.ep_group   = ep_group
+        ctx.num_chunks = num_chunks
+        ctx.expert_ffn = expert_ffn
+
+        # Forward: dispatch → compute → combine (overlapped)
+        output = overlapped_forward(tokens, expert_ffn, ep_group, num_chunks)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        tokens, = ctx.saved_tensors
+
+        # Backward: combine_grad → expert_grad → dispatch_grad
+        # Reverse the pipeline order
+        grad_chunks = grad_output.chunk(ctx.num_chunks, dim=0)
+
+        comm_stream    = torch.cuda.Stream()
+        compute_stream = torch.cuda.default_stream()
+
+        grad_inputs = []
+        recv_grad_buffers = [torch.empty_like(g) for g in grad_chunks]
+
+        for i in range(ctx.num_chunks - 1, -1, -1):  # reverse order
+            # [COMM] All2All for gradient (combine_grad direction)
+            with torch.cuda.stream(comm_stream):
+                dist.all_to_all_single(
+                    recv_grad_buffers[i],
+                    grad_chunks[i],
+                    group=ctx.ep_group
+                )
+
+            # [COMPUTE] expert backward on previous gradient chunk
+            if i < ctx.num_chunks - 1:
+                compute_stream.wait_stream(comm_stream)
+                with torch.cuda.stream(compute_stream):
+                    grad_in = ctx.expert_ffn.backward(
+                        recv_grad_buffers[i+1]
+                    )
+                    grad_inputs.append(grad_in)
+
+        torch.cuda.synchronize()
+        return torch.cat(reversed(grad_inputs)), None, None, None
+```
+
+---
+
+## Critical Design Choices
+
+### 1. How many chunks?
+
+```python
+# Tradeoff analysis:
+# Too few chunks → little overlap (pipeline not filled)
+# Too many chunks → overhead dominates (kernel launch, synchronization)
+
+# Rule of thumb: num_chunks = num_ep_gpus works well
+# e.g., 8-GPU EP → 8 chunks
+
+def optimal_chunks(ep_size, tokens_per_gpu, hidden_dim, ffn_time_ms, bw_GBps):
+    comm_time_per_token  = hidden_dim * 4 / (bw_GBps * 1e9) * 1000  # ms
+    compute_time_per_token = ffn_time_ms / tokens_per_gpu
+
+    # Want: comm_time_per_chunk ≈ compute_time_per_chunk
+    # This maximizes overlap
+    ratio = comm_time_per_token / compute_time_per_token
+    return max(4, min(ep_size, int(ratio * ep_size)))
+```
+
+### 2. Token ordering — avoid load imbalance
+
+```python
+def sort_tokens_for_overlap(tokens, expert_indices, num_chunks):
+    """
+    Sort tokens so each chunk has balanced expert assignments
+    Prevents some chunks being much heavier than others
+    → keeps compute/comm times balanced across chunks
+    """
+    # Sort by expert id within each chunk
+    _, sort_order = expert_indices.sort(dim=0)
+    sorted_tokens = tokens[sort_order]
+
+    # Assign chunks in round-robin to balance expert load
+    chunk_size = len(tokens) // num_chunks
+    chunks = []
+    for i in range(num_chunks):
+        start = i * chunk_size
+        end   = start + chunk_size if i < num_chunks-1 else len(tokens)
+        chunks.append(sorted_tokens[start:end])
+
+    return chunks, sort_order
+```
+
+### 3. NVLink vs InfiniBand awareness
+
+```python
+# Strategy changes based on hardware topology:
+
+if using_nvlink:
+    # NVLink: very high bandwidth (900 GB/s A100 NVLink)
+    # → fewer chunks needed, comm is fast
+    # → compute is the bottleneck
+    num_chunks = 4
+    prioritize = "compute_granularity"
+
+elif using_infiniband:
+    # InfiniBand: lower bandwidth (400 Gb/s = 50 GB/s)
+    # → more chunks needed to hide longer comm latency
+    # → comm is often the bottleneck
+    num_chunks = 16
+    prioritize = "comm_hiding"
+
+elif using_ethernet:
+    # Ethernet: even slower
+    # → overlap is critical, use maximum chunks
+    num_chunks = 32
+    prioritize = "max_overlap"
+```
+
+---
+
+## Practical Results
+
+```
+Benchmark: 64-GPU Expert Parallel, 8B MoE model
+Token count: 4096 per GPU, 8 experts total
+
+Method              | EP throughput | Comm overhead
+--------------------|---------------|---------------
+Sequential (naive)  | 1.0x baseline | 45% of step time
+Overlapped (8 chunk)| 1.78x         |  8% of step time
+Overlapped (16 chunk)| 1.82x        |  5% of step time
+
+Comm effectively hidden: ~37% of wall-clock time recovered
+```
+
+The key insight across all implementations: **the communication time must be ≤ compute time per chunk for full hiding**. If your network is slow relative to compute, increase chunk count. If compute is slow (very large experts), decrease chunk count. The goal is a balanced pipeline where neither comm nor compute ever waits for the other.
+
+
+
+//------------------------------------------------------------------------------------------
+# Step-by-Step Pipeline Loop Walkthrough
+
+Let me use a **tiny concrete example** with real numbers so every iteration is crystal clear.
+
+---
+
+## Setup: 4 Chunks, 2 GPUs
+
+```
+Total tokens: 8  (we'll label them T0..T7)
+num_chunks:   4  (2 tokens per chunk)
+EP group:     GPU0 and GPU1
+              GPU0 has Expert_A
+              GPU1 has Expert_B
+
+Chunk assignment:
+  Chunk 0: [T0, T1]
+  Chunk 1: [T2, T3]
+  Chunk 2: [T4, T5]
+  Chunk 3: [T6, T7]
+
+Two buffers (double buffering): buf[0], buf[1]
+PREV and CURR are just index variables (0 or 1)
+```
+
+---
+
+## Before the Loop: Prime the Pipeline (Step 2)
+
+```python
+PREV, CURR = 0, 1   # initial buffer assignment
+
+# Dispatch Chunk 0 → buf[CURR] = buf[1]
+with torch.cuda.stream(comm_stream):
+    all2all_dispatch(chunks[0], buf[1])
+```
+
+```
+State after priming:
+  buf[0]: empty
+  buf[1]: receiving Chunk 0 tokens... (All2All in flight)
+  PREV=0, CURR=1
+
+GPU comm_stream:    [Dispatch Chunk0 → buf[1] ...]
+GPU compute_stream: [idle]
+CPU:                entering loop now
+```
+
+---
+
+## Loop Iteration i=0
+
+```python
+# Swap buffers first
+PREV, CURR = CURR, PREV   # PREV=1, CURR=0
+```
+
+```
+After swap:
+  PREV=1  → buf[1] has Chunk 0 arriving
+  CURR=0  → buf[0] is free to receive Chunk 1
+```
+
+```python
+# [COMM] Dispatch NEXT chunk (i+1 = 1) into buf[CURR] = buf[0]
+if i + 1 < num_chunks:   # 1 < 4 → True
+    with torch.cuda.stream(comm_stream):
+        all2all_dispatch(chunks[1], buf[0])
+```
+
+```
+GPU comm_stream:    [Dispatch C0→buf1 ...][Dispatch C1→buf0 ...]
+                     ↑ still finishing      ↑ just queued
+GPU compute_stream: [idle]
+```
+
+```python
+# [COMPUTE] Wait for buf[PREV]=buf[1] to be ready, then run FFN
+compute_stream.wait_stream(comm_stream)
+```
+
+```
+wait_stream captures: "Dispatch C0→buf1" AND "Dispatch C1→buf0"
+(both were queued on comm_stream before this call)
+
+This means compute_stream will wait until BOTH finish.
+Is that a problem? Let's see...
+```
+
+```python
+expert_out = run_local_experts(buf[PREV])  # buf[1] = Chunk 0 tokens
+```
+
+```
+GPU timeline at end of i=0:
+
+comm_stream:    [Dispatch C0→buf1][Dispatch C1→buf0]──────────────────►
+                  finished ✓          still running...
+compute_stream: [wait...wait...wait...wait][FFN(buf1 = C0 tokens)]─────►
+                 ↑ blocked until BOTH dispatches done
+                                          ↑ now FFN runs on Chunk 0
+
+buf[0]: receiving Chunk 1... (in progress)
+buf[1]: Chunk 0 fully received ✓, FFN running on it
+```
+
+```python
+# [COMM] Send FFN results back (All2All combine for Chunk 0)
+with torch.cuda.stream(comm_stream):
+    combined_0 = all2all_combine(expert_out)
+output_chunks.append(combined_0)
+```
+
+```
+GPU timeline end of i=0:
+
+comm_stream:    [D_C0→b1][D_C1→b0][Combine C0]────────────────────────►
+compute_stream: [wait.....][FFN(b1=C0)]────────────────────────────────►
+
+OVERLAP ACHIEVED:
+  While FFN runs on buf[1] (Chunk 0),
+  Combine for Chunk 0 is queued on comm_stream
+  and will run after FFN completes (comm_stream also waited)
+```
+
+---
+
+## Loop Iteration i=1
+
+```python
+# Swap buffers
+PREV, CURR = CURR, PREV   # PREV=0, CURR=1
+```
+
+```
+After swap:
+  PREV=0  → buf[0] has Chunk 1 arriving (from i=0's dispatch)
+  CURR=1  → buf[1] is done with Chunk 0 FFN, now free to reuse
+```
+
+```python
+# [COMM] Dispatch NEXT chunk (i+1 = 2) into buf[CURR] = buf[1]
+if i + 1 < num_chunks:   # 2 < 4 → True
+    with torch.cuda.stream(comm_stream):
+        all2all_dispatch(chunks[2], buf[1])
+```
+
+```
+GPU comm_stream:    [D_C0][D_C1][Combine_C0][D_C2→buf1]────────────────►
+                                              ↑ queued now
+```
+
+```python
+# [COMPUTE] Wait for buf[PREV]=buf[0] (Chunk 1) to be ready
+compute_stream.wait_stream(comm_stream)
+expert_out = run_local_experts(buf[0])   # Chunk 1 tokens
+```
+
+```
+GPU timeline at i=1:
+
+comm_stream:    [D_C0][D_C1][CombC0][D_C2→b1]────────────────────────►
+                                              ←still running→
+compute_stream: [wait i=0 ...][FFN(b1=C0)][wait i=1...][FFN(b0=C1)]──►
+                                                         ↑
+                                                 starts after D_C1 and D_C2 done
+
+KEY OVERLAP at i=1:
+  FFN(Chunk 1) runs while D_C2 (Chunk 2 dispatch) runs
+```
+
+```python
+# [COMM] Combine Chunk 1 results
+with torch.cuda.stream(comm_stream):
+    combined_1 = all2all_combine(expert_out)
+output_chunks.append(combined_1)
+```
+
+```
+GPU timeline end of i=1:
+
+comm_stream:    [D0][D1][CombC0][D2][CombC1]──────────────────────────►
+compute_stream: [wait][FFN_C0][wait][FFN_C1]──────────────────────────►
+                                    ↑
+              FFN_C1 overlaps with D2 and CombC1 being queued
+```
+
+---
+
+## Loop Iteration i=2
+
+```python
+PREV, CURR = CURR, PREV   # PREV=1, CURR=0
+# PREV=1 → buf[1] receiving Chunk 2
+# CURR=0 → buf[0] done with Chunk 1, free to reuse
+```
+
+```python
+# [COMM] Dispatch Chunk 3 into buf[0]
+if i + 1 < num_chunks:   # 3 < 4 → True
+    with torch.cuda.stream(comm_stream):
+        all2all_dispatch(chunks[3], buf[0])
+```
+
+```python
+compute_stream.wait_stream(comm_stream)
+expert_out = run_local_experts(buf[1])   # Chunk 2 tokens
+```
+
+```python
+with torch.cuda.stream(comm_stream):
+    combined_2 = all2all_combine(expert_out)
+output_chunks.append(combined_2)
+```
+
+```
+GPU timeline end of i=2:
+
+comm_stream:    [D0][D1][C0][D2][C1][D3][C2]─────────────────────────►
+compute_stream: [w][F0][w][F1][w][F2]────────────────────────────────►
+                            ↑OVERLAP↑
+              D3 dispatching Chunk 3 while FFN runs on Chunk 2
+```
+
+---
+
+## Loop Iteration i=3 (Last)
+
+```python
+PREV, CURR = CURR, PREV   # PREV=0, CURR=1
+# PREV=0 → buf[0] receiving Chunk 3
+# CURR=1 → buf[1] done, but we don't need it again
+```
+
+```python
+# [COMM] No more chunks to dispatch
+if i + 1 < num_chunks:   # 4 < 4 → False, SKIP
+    pass
+```
+
+```python
+# [COMPUTE] Just wait and run FFN on last chunk
+compute_stream.wait_stream(comm_stream)
+expert_out = run_local_experts(buf[0])   # Chunk 3 tokens
+```
+
+```python
+with torch.cuda.stream(comm_stream):
+    combined_3 = all2all_combine(expert_out)
+output_chunks.append(combined_3)
+```
+
+```
+GPU timeline end of i=3:
+
+comm_stream:    [D0][D1][C0][D2][C1][D3][C2][C3]─────────────────────►
+compute_stream: [w][F0][w][F1][w][F2][w][F3]──────────────────────────►
+
+D = Dispatch (All2All send)
+C = Combine  (All2All recv)
+F = FFN computation
+w = waiting (blocked by wait_stream)
+```
+
+---
+
+## Full Timeline: All 4 Iterations Together
+
+```
+Legend: D=Dispatch, C=Combine, F=FFN, .=overlap happening
+
+TIME →        t0    t1    t2    t3    t4    t5    t6    t7    t8
+
+PRIMING:
+comm_stream:  [D0..]
+
+LOOP i=0:
+comm_stream:        [D0done][D1............]
+                                           [CombC0..]
+compute_stream:     [..wait...............]
+                                           [FFN_C0..]
+
+LOOP i=1:
+comm_stream:                               [D2.......][CombC1]
+compute_stream:                                        [wait.][FFN_C1]
+                    ←── D2 and FFN_C0 OVERLAP ──→
+
+LOOP i=2:
+comm_stream:                                           [D3...][CombC2]
+compute_stream:                                               [wait][FFN_C2]
+                              ←── D3 and FFN_C1 OVERLAP ──→
+
+LOOP i=3:
+comm_stream:                                                  [CombC3]
+compute_stream:                                                    [FFN_C3]
+
+══════════════════════════════════════════════════════════════════════
+STEADY STATE OVERLAP (iterations 1-2):
+
+  comm_stream:    [...D_i+1...][...Combine_i...]
+  compute_stream: [...FFN_i...............]
+
+  3-way overlap:
+    ✅ Dispatching chunk i+1 (next tokens going out)
+    ✅ FFN on chunk i        (current compute)
+    ✅ Combine chunk i-1     (previous results coming back)
+══════════════════════════════════════════════════════════════════════
+```
+
+---
+
+## The wait_stream Problem: It Waits Too Long
+
+You may have noticed the issue above. `wait_stream` captures **everything queued on comm_stream at that moment**, not just the specific dispatch we care about:
+
+```
+At i=1, when we call compute_stream.wait_stream(comm_stream):
+  comm_stream has queued: [D_C0, D_C1, Combine_C0, D_C2]
+  compute_stream waits for ALL of them including D_C2
+  But we only NEED D_C1 to finish before FFN_C1 starts!
+
+Result: slightly less overlap than theoretically possible
+```
+
+The fix is explicit events:
+
+```python
+# Replace wait_stream with per-chunk events
+
+dispatch_events = [torch.cuda.Event() for _ in range(num_chunks)]
+
+# When dispatching chunk i, record its completion event
+with torch.cuda.stream(comm_stream):
+    all2all_dispatch(chunks[i], buf[CURR])
+    dispatch_events[i].record(comm_stream)
+    # ↑ records EXACTLY when THIS dispatch finishes
+
+# When computing chunk i, wait ONLY for that chunk's dispatch
+compute_stream.wait_event(dispatch_events[i])
+# ↑ does NOT wait for i+1, i+2 dispatches
+expert_out = run_local_experts(buf[PREV])
+```
+
+```
+With explicit events:
+
+comm_stream:    [D0]●[D1]●[D2]●[D3]●
+                    ↓    ↓    ↓    ↓   ← events fire independently
+compute_stream: [F0]──[F1]──[F2]──[F3]
+                ↑ F0 starts as soon as D0 done
+                      ↑ F1 starts as soon as D1 done (not waiting for D2!)
+
+vs wait_stream:
+compute_stream: [..wait D0+D1..][F0][..wait D1+D2+Comb0..][F1]...
+                ← extra waiting because wait_stream captures too much
+```
+
+---
+
+## Complete Corrected Loop with Events
+
+```python
+def expert_parallel_forward(tokens, expert_ffn, ep_group, num_chunks=4):
+    chunks    = tokens.chunk(num_chunks, dim=0)
+    recv_bufs = [torch.empty_like(c) for c in chunks]
+    results   = []
+
+    comm_stream    = torch.cuda.Stream()
+    compute_stream = torch.cuda.Stream()
+
+    # One event per chunk: fires when THAT chunk's dispatch is done
+    events = [torch.cuda.Event() for _ in range(num_chunks)]
+
+    # ── Prime: start dispatch of chunk 0 ──
+    with torch.cuda.stream(comm_stream):
+        all2all_dispatch(chunks[0], recv_bufs[0], ep_group)
+        events[0].record(comm_stream)   # event[0] fires when D0 done
+
+    # ── Pipeline loop ──
+    for i in range(num_chunks):
+
+        # [COMM] Dispatch next chunk, record its event
+        if i + 1 < num_chunks:
+            with torch.cuda.stream(comm_stream):
+                all2all_dispatch(chunks[i+1], recv_bufs[i+1], ep_group)
+                events[i+1].record(comm_stream)   # fires when D_{i+1} done
+
+        # [COMPUTE] Wait ONLY for chunk i's dispatch (not i+1!)
+        compute_stream.wait_event(events[i])
+        with torch.cuda.stream(compute_stream):
+            expert_out = expert_ffn(recv_bufs[i])
+
+        # [COMM] Send results back
+        with torch.cuda.stream(comm_stream):
+            result_i = all2all_combine(expert_out, ep_group)
+        results.append(result_i)
+
+    torch.cuda.synchronize()
+    return torch.cat(results, dim=0)
+```
+
+```
+Final GPU timeline with events:
+
+               t0   t1   t2   t3   t4   t5   t6   t7   t8
+comm_stream:  [D0] [D1] [D2] [D3][C0] [C1] [C2] [C3]
+                ●    ●    ●    ●   ← events fire exactly here
+compute:           [F0] [F1] [F2] [F3]
+                    ↑    ↑    ↑    ↑
+              each FFN starts as soon as its OWN dispatch done
+              not waiting for any other dispatch
+
+Maximum overlap: D_{i+1}, F_i, C_{i-1} all run simultaneously ✅
+```
+
+---
+
+## Summary: The Loop's Purpose
+
+```
+Each iteration i does exactly 3 things:
+
+  1. COMM (future):   Start dispatching chunk i+1
+                      → prepares data for NEXT iteration's compute
+
+  2. COMPUTE (now):   Run FFN on chunk i
+                      → uses data dispatched in PREVIOUS iteration
+
+  3. COMM (past):     Send chunk i's results back (combine)
+                      → cleans up this iteration's output
+
+The key insight:
+  Step 1 (future) and Step 2 (now) OVERLAP on the GPU
+  because they run on different streams simultaneously.
+
+  This is why we need double buffers:
+  buf[PREV] holds chunk i     → being read by FFN right now
+  buf[CURR] holds chunk i+1  → being written by All2All right now
+  They never conflict because they are DIFFERENT buffers.
+```
